@@ -1,14 +1,16 @@
-# openpi-control
+# openpi-basic-control
 
-`openpi-control` is a native C++ robot-control library. Each arm
+> [!WARNING]
+> `openpi-basic-control` is meant to be a minimal but hackable working example. It is not thoroughly documented or tested, and should not be considered a production-quality solution. We (Physical Intelligence) may not have the bandwidth to maintain this repository, or review any contributions. Feel free to fork it instead!
+
+`openpi-basic-control` is a minimal C++ robot-control library. Each arm
 runs one `pi_control_node` process that communicates with the main
 Python process via ZeroMQ.
 
 | Arm | Follower effector | Leader effector |
 | --- | --- | --- |
 | `Yam` | `E_Yam` | `E_Yam_Handle` |
-| `ARX_L5` | `E_ARX` | `E_ARX` |
-| `ARX_X5` | `E_ARX` | `E_ARX` |
+| `ARX_X5` | `E_ARX` | `E_ARX_ENC` |
 | `FR3` | `Robotiq` | — |
 
 ```python
