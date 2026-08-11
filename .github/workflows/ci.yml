@@ -73,7 +73,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .deps
-          key: openpi-control-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
+          key: ${{ github.event.repository.name }}-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
 
       - name: Cache compiler outputs
         uses: actions/cache@v4
@@ -137,7 +137,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .deps
-          key: openpi-control-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
+          key: ${{ github.event.repository.name }}-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
 
       - name: Cache compiler outputs
         uses: actions/cache@v4
@@ -232,7 +232,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .deps
-          key: openpi-control-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
+          key: ${{ github.event.repository.name }}-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
 
       - name: Cache compiler outputs
         uses: actions/cache@v4
@@ -294,7 +294,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .deps
-          key: openpi-control-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
+          key: ${{ github.event.repository.name }}-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_deps.sh') }}
 
       - name: Cache compiler outputs
         uses: actions/cache@v4
