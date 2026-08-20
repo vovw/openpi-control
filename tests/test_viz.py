@@ -420,7 +420,19 @@ def test_live_drives_the_rig_scene_from_the_arms(monkeypatch) -> None:
     stop = threading.Event()
     stop.set()  # one pass through the mirror loop, then unwind
 
-    assert cli.run_live(rig, visualize=True, backend_factory=backend_factory, stop=stop) == 0
+    # camera_preview=False on purpose: this test is about the arm-to-scene
+    # wiring, and a developer with the cell's cameras plugged in should not
+    # have the suite take them away from whatever is streaming them.
+    assert (
+        cli.run_live(
+            rig,
+            visualize=True,
+            camera_preview=False,
+            backend_factory=backend_factory,
+            stop=stop,
+        )
+        == 0
+    )
 
     assert len(scenes) == 1
     assert scenes[0].names == rig.names
@@ -428,3 +440,175 @@ def test_live_drives_the_rig_scene_from_the_arms(monkeypatch) -> None:
     for backend in made.values():
         assert backend.closes[0] is True
         assert not backend.connected
+
+
+# --------------------------------------------------------------------------- #
+# camera preview
+# --------------------------------------------------------------------------- #
+
+
+class _FakeReader:
+    """A CameraReader's preview surface: a spec, a frame count, and latest().
+
+    Fake rather than real on purpose -- a suite that opens the cell's cameras
+    takes them away from whatever is streaming them, and the panel's job is
+    pushing frames, not capturing them.
+    """
+
+    def __init__(self, name: str, *, label: str = "", frame=None) -> None:
+        from openpi_control.cameras import CameraSpec
+
+        self.spec = CameraSpec(
+            name=name, label=label, serial="254623070531", device=f"/dev/{name}"
+        )
+        self.frames_read = 0
+        self._frame = frame
+
+    def latest(self):
+        return self._frame
+
+    def publish(self, frame) -> None:
+        """What the capture thread does: newest frame wins, count goes up."""
+        self._frame = frame
+        self.frames_read += 1
+
+
+def _frame(width: int = 848, height: int = 480) -> np.ndarray:
+    """A BGR frame whose channels are tellable apart, so a flip is visible."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[..., 0] = 10  # blue
+    frame[..., 1] = 120  # green
+    frame[..., 2] = 240  # red
+    return frame
+
+
+@pytest.fixture
+def preview_server():
+    import viser
+
+    created = []
+
+    def factory():
+        server = viser.ViserServer(port=next(_PORT))
+        created.append(server)
+        return server
+
+    yield factory
+    for server in created:
+        server.stop()
+
+
+def test_a_preview_tile_exists_before_any_frame_arrives(preview_server) -> None:
+    """The layout is final when the page opens, not after the first frame."""
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader})
+
+    assert panel.names == ("top",)
+    panel.step(1.0)  # nothing published yet
+    assert reader.latest() is None  # and the panel did not invent one
+
+
+def test_a_published_frame_reaches_its_tile_as_rgb(preview_server) -> None:
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader})
+    reader.publish(_frame())
+
+    panel.step(1.0)
+
+    image = panel._tiles["top"].image
+    # BGR in, RGB out: the red channel of the source has to come out first.
+    assert tuple(image[0, 0]) == (240, 120, 10)
+    assert image.dtype == np.uint8
+    assert image.flags["C_CONTIGUOUS"]  # encoders want contiguous memory
+
+
+def test_a_preview_is_shrunk_to_the_requested_width(preview_server) -> None:
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader}, max_width=400)
+    reader.publish(_frame(848, 480))
+
+    panel.step(1.0)
+
+    height, width, _ = panel._tiles["top"].image.shape
+    assert width <= 400
+    # 848 -> stride 3 -> 283x160, and the aspect ratio survives the subsample.
+    assert (width, height) == (283, 160)
+
+
+def test_a_frame_already_smaller_than_the_cap_is_left_alone(preview_server) -> None:
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader}, max_width=400)
+    reader.publish(_frame(320, 240))
+
+    panel.step(1.0)
+
+    assert panel._tiles["top"].image.shape == (240, 320, 3)
+
+
+def test_a_preview_pushes_at_its_own_rate_not_the_callers(preview_server) -> None:
+    """The mirror runs at 30 Hz; a preview has no reason to."""
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader}, rate_hz=10.0)
+    reader.publish(_frame())
+    panel.step(1.0)
+    first = panel._tiles["top"].image
+
+    reader.publish(_frame() // 2)  # a new, different frame
+    panel.step(1.0 / 30.0)  # one mirror tick: inside the preview period
+
+    assert np.array_equal(panel._tiles["top"].image, first)  # not pushed yet
+    panel.step(1.0 / 30.0)
+    panel.step(1.0 / 30.0)  # three mirror ticks add up to a preview period
+    assert not np.array_equal(panel._tiles["top"].image, first)
+
+
+def test_a_camera_that_stopped_delivering_is_not_pushed_again(preview_server) -> None:
+    """A frozen stream holds its last image instead of re-encoding it."""
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader})
+    reader.publish(_frame())
+
+    panel.step(1.0)
+    assert panel._pushed["top"] == 1
+    panel.step(1.0)  # a full period later, still the same frame
+    assert panel._pushed["top"] == 1
+
+
+def test_a_tile_is_labelled_by_camera_name_first(preview_server) -> None:
+    """``name`` is the word the rig, the CLI, and the dataset all use."""
+    panel = viz.CameraPanel(
+        preview_server(), {"left_wrist": _FakeReader("left_wrist", label="left gripper view")}
+    )
+
+    assert panel._tiles["left_wrist"].label == "left_wrist — left gripper view"
+
+
+def test_a_panel_with_no_cameras_is_allowed(preview_server) -> None:
+    """``--only left`` on a rig whose one camera is unplugged still runs."""
+    panel = viz.CameraPanel(preview_server(), {})
+
+    assert panel.names == ()
+    panel.step(1.0)  # and stepping it is a no-op, not a crash
+
+
+def test_a_preview_refuses_nonsense_settings(preview_server) -> None:
+    for kwargs in ({"max_width": 0}, {"rate_hz": 0.0}, {"rate_hz": -1.0}):
+        with pytest.raises(ConfigurationError):
+            viz.CameraPanel(preview_server(), {}, **kwargs)
+
+
+def test_a_preview_refuses_a_frame_that_is_not_a_colour_image(preview_server) -> None:
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader})
+    reader.publish(np.zeros((480, 848), dtype=np.uint8))  # a depth frame, say
+
+    with pytest.raises(ConfigurationError, match="HxWx3"):
+        panel.step(1.0)
+
+
+def test_removing_a_panel_drops_its_tiles(preview_server) -> None:
+    panel = viz.CameraPanel(preview_server(), {"top": _FakeReader("top")})
+
+    panel.remove()
+
+    assert panel._tiles == {}

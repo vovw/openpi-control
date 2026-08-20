@@ -236,6 +236,31 @@ class Rig:
         """The same rig with no cameras, for a state-only run."""
         return dataclasses.replace(self, cameras=())
 
+    def with_camera_capture(
+        self, *, fps: int | None = None, pixel_format: str | None = None
+    ) -> Rig:
+        """Copy of this rig with different capture settings on every camera.
+
+        Rate and pixel format are properties of a *run*, not of the cell: a
+        recorder wants the highest rate the cameras will give and RGB straight
+        from the SDK, while a browser preview wants neither. The rig keeps the
+        defaults; a command overrides them here rather than each camera being
+        redeclared.
+        """
+        changes: dict[str, object] = {}
+        if fps is not None:
+            changes["fps"] = fps
+        if pixel_format is not None:
+            changes["pixel_format"] = pixel_format
+        if not changes:
+            return self
+        return dataclasses.replace(
+            self,
+            cameras=tuple(
+                dataclasses.replace(camera, **changes) for camera in self.cameras
+            ),
+        )
+
 
 def _yam_bimanual() -> Rig:
     """Two YAM followers, each with its own gripper, on adjacent CAN buses.

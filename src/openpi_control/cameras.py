@@ -72,6 +72,22 @@ DEFAULT_FPS = 30
 # Rotations a capture thread can apply. Anything else is a typo, not a request.
 VALID_ROTATIONS = (0, 90, 180, 270)
 
+# Pixel formats a reader can be asked for. The SDK converts in native code as
+# part of the frame it hands over, so asking for the layout you actually want is
+# free -- see `record.to_rgb` for what doing it afterwards costs. bgr8 is the
+# default because OpenCV's imwrite and the browser preview expect it; a dataset
+# recorder asks for rgb8 and then needs no conversion at all.
+VALID_PIXEL_FORMATS = ("bgr8", "rgb8")
+DEFAULT_PIXEL_FORMAT = "bgr8"
+
+
+# How long to keep retrying a camera that reports itself busy, and how often.
+# The kernel holds a v4l2 node for a moment after a stream stops, so two
+# back-to-back runs would otherwise collide with each other rather than with a
+# real second consumer.
+BUSY_RETRY_S = 3.0
+BUSY_RETRY_INTERVAL_S = 0.25
+
 
 @dataclass(frozen=True, slots=True)
 class RigCamera:
@@ -101,6 +117,7 @@ class RigCamera:
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
     fps: int = DEFAULT_FPS
+    pixel_format: str = DEFAULT_PIXEL_FORMAT
     color_index: int = DEFAULT_COLOR_INDEX
 
     def __post_init__(self) -> None:
@@ -119,6 +136,11 @@ class RigCamera:
         if self.width <= 0 or self.height <= 0 or self.fps <= 0:
             raise ConfigurationError(
                 f"camera {self.name!r} needs a positive width, height, and fps"
+            )
+        if self.pixel_format not in VALID_PIXEL_FORMATS:
+            raise ConfigurationError(
+                f"camera {self.name!r} asks for pixel format {self.pixel_format!r}; "
+                f"supported: {', '.join(VALID_PIXEL_FORMATS)}"
             )
 
 
@@ -142,6 +164,7 @@ class FoundCamera:
             height=self.camera.height,
             fps=self.camera.fps,
             rotate=self.camera.rotate,
+            pixel_format=self.camera.pixel_format,
         )
 
 
@@ -182,6 +205,27 @@ class CameraSpec:
     height: int = DEFAULT_HEIGHT
     fps: int = DEFAULT_FPS
     rotate: int = 0
+    pixel_format: str = DEFAULT_PIXEL_FORMAT
+
+    def __post_init__(self) -> None:
+        # RigCamera validates the same fields, but a spec can also be built by
+        # hand -- and this is the type CameraReader consumes, so an unchecked
+        # value here surfaces as an SDK AttributeError or a KeyError deep in the
+        # capture thread rather than as a configuration error.
+        if self.pixel_format not in VALID_PIXEL_FORMATS:
+            raise ConfigurationError(
+                f"camera {self.name!r} asks for pixel format {self.pixel_format!r}; "
+                f"supported: {', '.join(VALID_PIXEL_FORMATS)}"
+            )
+        if self.rotate not in VALID_ROTATIONS:
+            raise ConfigurationError(
+                f"camera {self.name!r} asks for rotate={self.rotate}; valid: "
+                f"{', '.join(str(rotation) for rotation in VALID_ROTATIONS)}"
+            )
+        if self.width <= 0 or self.height <= 0 or self.fps <= 0:
+            raise ConfigurationError(
+                f"camera {self.name!r} needs a positive width, height, and fps"
+            )
 
 
 def present_serials(by_id_dir: Path | None = None) -> dict[tuple[str, int], str]:
@@ -290,21 +334,53 @@ class CameraReader:
         # off ``/dev/v4l/by-id`` (and out of vr-teleop-kit's cams.env).
         config.enable_device(sdk_serial_for_asic(spec.serial))
         config.enable_stream(
-            rs.stream.color, spec.width, spec.height, rs.format.bgr8, spec.fps
+            rs.stream.color,
+            spec.width,
+            spec.height,
+            {"bgr8": rs.format.bgr8, "rgb8": rs.format.rgb8}[spec.pixel_format],
+            spec.fps,
         )
         self._pipeline = rs.pipeline()
-        try:
-            self._profile = self._pipeline.start(config)
-        except RuntimeError as err:
-            raise ConfigurationError(
-                f"cannot start camera {spec.name!r} (serial {spec.serial}) at "
-                f"{spec.width}x{spec.height}@{spec.fps}: {err}"
-            ) from err
+        self._profile = self._start(config, spec)
 
         self._thread = threading.Thread(
             target=self._loop, name=f"camera-{spec.name}", daemon=True
         )
         self._thread.start()
+
+    def _start(self, config, spec: CameraSpec):  # noqa: ANN001, ANN202 - SDK types
+        """Start the pipeline, retrying briefly while the device is still busy.
+
+        Closing a stream does not free the v4l2 node instantly -- the kernel
+        holds it for a moment after the SDK lets go. Without this, re-running a
+        command right after the previous one exits fails with "Device or
+        resource busy", which looks like a hardware fault and is not one. A
+        camera genuinely held by another process still fails, just a second
+        later.
+        """
+        deadline = time.monotonic() + BUSY_RETRY_S
+        while True:
+            try:
+                return self._pipeline.start(config)
+            except RuntimeError as err:
+                busy = "busy" in str(err).lower()
+                if not busy or time.monotonic() >= deadline:
+                    hint = (
+                        " — another process is streaming it (a camera opens once)"
+                        if busy
+                        else ""
+                    )
+                    raise ConfigurationError(
+                        f"cannot start camera {spec.name!r} (serial {spec.serial}) at "
+                        f"{spec.width}x{spec.height}@{spec.fps}: {err}{hint}"
+                    ) from err
+                time.sleep(BUSY_RETRY_INTERVAL_S)
+
+    @property
+    def pixel_format(self) -> str:
+        """The channel order :meth:`latest` hands back. Read it, do not assume:
+        converting an already-RGB frame swaps the channels back the wrong way."""
+        return self.spec.pixel_format
 
     @property
     def frames_read(self) -> int:
@@ -353,7 +429,7 @@ class CameraReader:
             self._started.set()
 
     def latest(self) -> np.ndarray | None:
-        """The newest frame, BGR, or None before the first one arrives."""
+        """The newest frame, in :attr:`pixel_format`, or None before the first."""
         with self._lock:
             return self._frame
 
@@ -467,6 +543,28 @@ def sdk_serial_for_asic(asic_serial: str) -> str:
         f"no RealSense with ASIC serial {asic_serial} is connected; the SDK sees "
         f"{', '.join(available) if available else 'none'}"
     )
+
+
+def supported_color_modes(serial: str) -> dict[tuple[int, int], tuple[int, ...]]:
+    """``{(width, height): (fps, ...)}`` the camera's colour stream offers.
+
+    Enumeration only -- it opens no stream, so this is cheap enough to run in a
+    preflight. Used to answer "you asked for 45 fps" with the rates the device
+    actually has instead of letting the SDK fail with a bare ioctl error.
+    """
+    rs = _require_realsense()
+    target = sdk_serial_for_asic(serial)
+    modes: dict[tuple[int, int], set[int]] = {}
+    for device in rs.context().query_devices():
+        if str(device.get_info(rs.camera_info.serial_number)) != target:
+            continue
+        for sensor in device.query_sensors():
+            for profile in sensor.get_stream_profiles():
+                if profile.stream_type() != rs.stream.color:
+                    continue
+                video = profile.as_video_stream_profile()
+                modes.setdefault((video.width(), video.height()), set()).add(video.fps())
+    return {size: tuple(sorted(rates)) for size, rates in sorted(modes.items())}
 
 
 def _require_realsense():  # noqa: ANN202 - the pyrealsense2 module, Any by design

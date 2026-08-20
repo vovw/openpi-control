@@ -119,6 +119,33 @@ and capture through `pyrealsense2` rather than OpenCV (whose V4L2 path tops out
 near 10-13 fps on the same node that `v4l2-ctl` streams at 30). See
 [docs/cameras.md](docs/cameras.md).
 
+## Collecting data
+
+`openpi-control record` teleoperates a rig from a Meta Quest and writes the
+episodes as a LeRobot dataset — parquet for state and action, one mp4 per camera.
+
+```bash
+uv sync --extra lerobot
+vr-teleop-relay                                     # in the vr-teleop-kit checkout
+uv run openpi-control record --repo-id you/yam-fold-towel \
+    --task "fold the towel in half" --num-episodes 20 --vr-kit ~/vr-teleop-kit
+```
+
+VR teleoperation itself is not reimplemented here:
+[`vr-teleop-kit`](https://github.com/Dream-Machines-Robotics/vr-teleop-kit) owns
+the WebXR relay, the pose mapping, and the YAM inverse kinematics, and
+`openpi_control.teleop_vr` adapts it so the headset drives arms through this
+package's native stack. Right B starts an episode, left Y saves it.
+
+`--teleop hold --dry-run` rehearses a whole session — arms up, cameras open,
+nothing written — so the pipeline can be checked without a headset.
+
+Note that the gripper convention is **inverted** between this package (`1.0` =
+open) and LeRobot (`0.0` = open); recorded datasets use LeRobot's, and
+`record.to_native_gripper` is the one place that converts back. That and the
+other three ways a dataset comes out quietly wrong are in
+[docs/recording.md](docs/recording.md).
+
 ## Visualizing an arm
 
 `openpi_control.viz` serves any packaged model in the browser with
@@ -165,6 +192,7 @@ owns the power-on and power-off that a live view implies. See
 | --- | --- |
 | [docs/cli.md](docs/cli.md) | `doctor` checks, `zero` safeguards, rigs, `live` power on/off |
 | [docs/cameras.md](docs/cameras.md) | camera identity, discovery, the two D405 serials, capture rates |
+| [docs/recording.md](docs/recording.md) | LeRobot datasets, VR teleop, gripper polarity, episode boundaries |
 | [docs/viser.md](docs/viser.md) | render modes, mesh sourcing, rigs, joint ordering |
 | [docs/fr3.md](docs/fr3.md) | FR3 firmware, networking, controller, validation |
 | [docs/yam_teaching_handle.md](docs/yam_teaching_handle.md) | YAM handle CAN protocol and trigger calibration |

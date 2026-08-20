@@ -168,8 +168,15 @@ class ArmControlPanel:
             if self._has_effector:
                 # Normalized, because that is what PositionCommand takes: the
                 # node owns the mapping from [0, 1] to this gripper's travel.
+                # 1.0 is OPEN, not closed -- the native effector's ready pose is
+                # normalized 1.0 and it opens the gripper. This slider's value
+                # goes straight into a PositionCommand, so a label that had the
+                # two ends the wrong way round would invite an operator to close
+                # a gripper while believing they were opening it. The initial
+                # value is open for the same reason: it is what shows before the
+                # first state arrives, and closed is the wrong way to guess.
                 self._effector_slider = gui.add_slider(
-                    "gripper (0 open — 1 closed)", min=0.0, max=1.0, step=0.01, initial_value=0.0
+                    "gripper (0 closed — 1 open)", min=0.0, max=1.0, step=0.01, initial_value=1.0
                 )
                 self._effector_slider.disabled = True
 

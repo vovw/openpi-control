@@ -26,6 +26,15 @@ base pose -- a bimanual cell, or a leader/follower pair::
     })
     scene.update("left", left.read_state().joints.position_rad)
 
+:class:`CameraPanel` puts the rig's cameras on the same page, one tile each. It
+takes readers that are already open and never opens one itself, so this module
+still holds no device and still needs no RealSense SDK to import::
+
+    from openpi_control.viz import CameraPanel
+
+    panel = CameraPanel(scene.server, readers)
+    panel.step(dt)          # on the caller's clock; throttles itself internally
+
 Run ``python -m openpi_control.viz --model Yam`` for a standalone viewer whose
 GUI sliders drive the joints.
 """
@@ -64,6 +73,21 @@ _AXIS_MARKER_LENGTH_M = 0.045
 
 _BONE_COLOR = (110, 125, 145)
 _AXIS_MARKER_COLOR = (250, 165, 40)
+
+# Browser camera preview. A preview answers "where is that wrist pointing" and
+# "is the light any good" -- it is not a recording, so it wants to be legible
+# and cheap rather than faithful. Three 848x480 streams pushed whole at the
+# 30 Hz mirror rate is ~35 MB/s of websocket for a question a 400px thumbnail
+# at 10 Hz answers just as well.
+_PREVIEW_MAX_WIDTH = 400
+_PREVIEW_RATE_HZ = 10.0
+_PREVIEW_JPEG_QUALITY = 70
+
+# What a preview tile shows before its camera's first frame lands, so the panel
+# has its final layout from the moment the page opens rather than growing a
+# tile per camera over the first second.
+_PREVIEW_PLACEHOLDER = (32, 34, 38)
+
 
 # Per-arm tints, so the arms of a bimanual scene stay tellable apart.
 _ARM_COLORS = (
@@ -685,6 +709,123 @@ class ArmSceneVisualizer:
         label = self.label or f"{len(self.arms)} arms"
         print(f"{label} ({summary}) on {self.url} — ctrl-c to stop")
         _serve_until_interrupted(self.server)
+
+
+class CameraPanel:
+    """Live camera thumbnails in the browser, one tile per camera.
+
+    This takes readers that are *already open* and never opens one itself,
+    which is what keeps this module honest: :mod:`openpi_control.viz` draws and
+    holds no device, so it stays importable and testable on a box with no
+    RealSense SDK, exactly as it stays usable against a dead cell. A reader is
+    anything with a ``spec`` and a ``latest()`` -- see
+    :class:`openpi_control.cameras.CameraReader`.
+
+    Frames are pushed on the caller's clock, the same clock that pumps the
+    poses, so a preview cannot drift into being its own thread fighting the
+    render for the websocket. It is throttled to ``rate_hz`` and shrunk to
+    ``max_width`` independently of that clock, because the mirror runs at 30 Hz
+    and a preview has no reason to::
+
+        panel = CameraPanel(scene.server, readers)
+        while running:
+            panel.step(dt)
+
+    A camera that stops delivering stops being pushed: tiles are keyed off the
+    reader's frame count, so a dead stream holds its last image instead of
+    re-encoding it ten times a second.
+    """
+
+    def __init__(
+        self,
+        server: Any,
+        readers: Mapping[str, Any],
+        *,
+        folder: str = "Cameras",
+        max_width: int = _PREVIEW_MAX_WIDTH,
+        rate_hz: float = _PREVIEW_RATE_HZ,
+        jpeg_quality: int = _PREVIEW_JPEG_QUALITY,
+    ) -> None:
+        if max_width <= 0:
+            raise ConfigurationError("a camera preview needs a positive max_width")
+        if rate_hz <= 0:
+            raise ConfigurationError("a camera preview needs a positive rate_hz")
+        self.server = server
+        self._readers = dict(readers)
+        self._max_width = max_width
+        self._period = 1.0 / rate_hz
+        self._jpeg_quality = jpeg_quality
+        self._since_push = self._period  # push on the first step, not a tick late
+        self._pushed: dict[str, int] = {}
+        self._tiles: dict[str, Any] = {}
+
+        placeholder = np.full((3, 4, 3), _PREVIEW_PLACEHOLDER, dtype=np.uint8)
+        with server.gui.add_folder(folder):
+            for name, reader in self._readers.items():
+                self._tiles[name] = server.gui.add_image(
+                    placeholder,
+                    label=self._label(name, reader),
+                    format="jpeg",
+                    jpeg_quality=jpeg_quality,
+                )
+
+    @staticmethod
+    def _label(name: str, reader: Any) -> str:
+        """``name`` first: it is the word the rig, the CLI, and datasets use."""
+        description = getattr(getattr(reader, "spec", None), "label", None)
+        return f"{name} — {description}" if description else name
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._readers)
+
+    def step(self, dt: float) -> None:
+        """Push each camera's newest frame, at most once per preview period."""
+        self._since_push += dt
+        if self._since_push < self._period:
+            return
+        self._since_push = 0.0
+        for name, reader in self._readers.items():
+            frame = reader.latest()
+            if frame is None:
+                continue
+            # frames_read is the cheap "is this the same picture again" test;
+            # a reader that does not keep one is simply pushed every period.
+            count = getattr(reader, "frames_read", None)
+            if count is not None:
+                if self._pushed.get(name) == count:
+                    continue
+                self._pushed[name] = count
+            self._tiles[name].image = _thumbnail(
+                frame, self._max_width, pixel_format=getattr(reader, "pixel_format", "bgr8")
+            )
+
+    def remove(self) -> None:
+        """Drop every tile from the GUI. The readers are the caller's to close."""
+        for tile in self._tiles.values():
+            tile.remove()
+        self._tiles.clear()
+
+
+def _thumbnail(frame: np.ndarray, max_width: int, *, pixel_format: str = "bgr8") -> np.ndarray:
+    """A small RGB copy of one capture frame.
+
+    Subsampling by stride rather than resampling is what lets a preview cost one
+    numpy copy and no OpenCV: capture already refuses to depend on cv2, and a
+    thumbnail whose only job is to show aim and lighting gains nothing from
+    interpolation.
+
+    The channel order is asked for, not assumed -- a reader opened as ``rgb8``
+    (which is what the dataset recorder does) would come out with red and blue
+    swapped if this flipped unconditionally.
+    """
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ConfigurationError(
+            f"a camera preview wants an HxWx3 frame, got shape {frame.shape}"
+        )
+    stride = max(1, -(-frame.shape[1] // max_width))
+    step = 1 if pixel_format == "rgb8" else -1
+    return np.ascontiguousarray(frame[::stride, ::stride, ::step])
 
 
 def _serve_until_interrupted(server: Any) -> None:

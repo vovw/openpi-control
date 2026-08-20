@@ -9,6 +9,7 @@ is sane, set each servo's firmware zero, and bring a whole rig up and back down.
 | `zero` | writes servo firmware; confirms first |
 | `live` | **energizes the arms**, and owns putting them down again |
 | `cameras` | no, unless given `--probe` (which opens camera streams, not the bus) |
+| `record` | **energizes the arms** and teleoperates them, like `live` |
 
 Every command attaches `runlog.setup_run_logging`, so each run leaves a trace
 under `~/openpi-data/logs/runtime/<command>.log`, including native crashes.
@@ -213,6 +214,7 @@ preflight right: all checks pass
 
   left     Yam on can0 — energized, holding
   right    Yam on can1 — energized, holding
+  cameras  top, left_wrist, right_wrist — live in the browser
   viser    http://localhost:8080
 ctrl-c to park at home_pos and power down
 ```
@@ -226,6 +228,8 @@ ctrl-c to park at home_pos and power down
 | `--no-park` | de-energize where the arm stands instead of parking it first |
 | `--no-viz` | energize and hold without serving the browser view |
 | `--control` | add the per-arm browser control panel (see below) |
+| `--no-cameras` | skip the camera tiles, leaving the cameras free for another process |
+| `--camera NAME=DEVICE` | pin one camera to an explicit device |
 | `--port` | viser HTTP port (default 8080) |
 | `--mesh-dir` | directory holding the URDF's meshes |
 | `--skip-preflight` | energize without running the doctor checks first |
@@ -273,8 +277,41 @@ screen rather than tearing down a session that is holding two energized arms.
 Without `--control` the page is a view and nothing more — no GUI sliders, so
 nothing on it can move an arm.
 
+The rig's cameras appear alongside it, one tile per camera, under **Cameras**
+— so "is the right wrist actually pointing at the thing" is answered on the
+same page that shows the pose, without a headset and without a second tool.
+See [Cameras in the browser](#cameras-in-the-browser) below.
+
 `--no-viz` skips the browser entirely, for when you just want both arms up and
 holding.
+
+### Cameras in the browser
+
+Tiles are previews, and priced like previews: each frame is subsampled to 400 px
+wide and pushed at 10 Hz, not the 30 Hz the poses go out at. Three 848x480
+streams pushed whole on the mirror clock would be ~35 MB/s of websocket to
+answer a question a thumbnail answers just as well. They ride the same clock as
+the poses rather than a thread of their own, so images and poses share one
+socket instead of racing for it.
+
+What a tile does *not* do is hide a problem:
+
+- A camera that is not on the bus is named on stdout and gets no tile. `live`
+  exists to drive arms — an unplugged wrist camera costs you a tile, not the
+  session. (`record` is the opposite: there, all-or-none, because a dataset
+  with a view silently missing is a corrupt dataset.)
+- A camera another process is already streaming is named the same way. **Only
+  one process can hold a camera**, so `live` and `record` cannot both preview
+  the same cell, and neither can two `live` sessions.
+- A camera that stops delivering holds its last image rather than re-encoding
+  it ten times a second.
+
+`--no-cameras` skips them, which is how you leave the cameras free for a
+recorder or a policy while still driving the arms from the browser.
+
+Cameras follow `--only` the way they do everywhere else: `--only right` brings
+up one arm with the overhead and right-wrist views, and drops the left wrist
+camera along with the arm it rides on.
 
 ### Driving the arms from the browser
 
@@ -380,3 +417,29 @@ the rig is the *ASIC* serial — the one in `/dev/v4l/by-id` — not the differe
 number `pyrealsense2` reports. See [docs/cameras.md](cameras.md) for that
 distinction, for why the default mode is 848x480, and for why capture goes
 through the RealSense SDK instead of OpenCV.
+
+## record
+
+Teleoperates a rig from a Quest headset and writes the episodes as a LeRobot
+dataset. Energizes the arms and owns putting them down again, exactly like
+`live`.
+
+```bash
+uv sync --extra lerobot
+vr-teleop-relay                                    # in the vr-teleop-kit checkout
+uv run openpi-control record --repo-id you/task \
+    --task "fold the towel" --num-episodes 20 --vr-kit ~/vr-teleop-kit
+```
+
+Right B starts (or redoes) an episode; left Y saves it. No headset to hand?
+`--teleop hold --dry-run` runs the whole session with the arms stationary, which
+checks the cameras, the schema, and the loop rate without collecting data.
+
+Preflight is stricter than `doctor`'s: a declared camera that is not on the bus
+is fatal, because recording with a view silently absent yields a dataset that is
+wrong rather than a cell that is merely unchecked.
+
+Two details that will cost you data if you do not know them — the gripper
+polarity is **inverted** between this package (1.0 open) and LeRobot (0.0 open),
+and ctrl-c during an open episode discards it. Both, plus the teardown ordering
+and the stall handling, are in [docs/recording.md](recording.md).

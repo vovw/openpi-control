@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 from fake_arm_backend import FakeArmBackend
@@ -764,3 +765,358 @@ def test_doctor_on_a_rig_reports_its_cameras(fake_camera_bus, no_mesh_cache, cap
     assert "cameras (3 declared)" in out
     assert out.count("camera top") == 1
     assert "2 arms, 3 cameras" in out
+
+
+# --------------------------------------------------------------------------- #
+# record
+# --------------------------------------------------------------------------- #
+
+
+def test_record_without_a_repo_id_says_what_to_do(capsys) -> None:
+    # Defaulting the dataset id would scatter half-finished datasets under
+    # whatever name happened to be generated.
+    assert cli.main(["record", "--task", "fold the towel"]) == 2
+
+    assert "--repo-id" in capsys.readouterr().err
+
+
+def test_record_dry_run_needs_no_repo_id(fake_camera_bus, monkeypatch) -> None:
+    # --dry-run rehearses a session with the arms live and writes nothing, so
+    # there is no dataset to name.
+    fake_camera_bus([])
+    seen: dict[str, object] = {}
+
+    def fake_run(rig, **kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "run_record", fake_run)
+
+    assert cli.main(["record", "--dry-run", "--no-cameras", "--skip-preflight"]) == 0
+    assert seen["dry_run"] is True
+    assert seen["repo_id"] is None
+
+
+def test_record_warns_when_the_task_is_unset(fake_camera_bus, monkeypatch, capsys) -> None:
+    # The task string lands on every frame, and relabelling means rewriting the
+    # dataset, so an unset --task deserves a word rather than a silent default.
+    fake_camera_bus([])
+    monkeypatch.setattr(cli, "run_record", lambda rig, **kwargs: 0)
+
+    cli.main(["record", "--dry-run", "--no-cameras", "--skip-preflight"])
+
+    assert "no --task given" in capsys.readouterr().err
+
+
+def test_record_refuses_a_nonsense_frame_rate(capsys) -> None:
+    assert cli.main(["record", "--dry-run", "--fps", "0"]) == 2
+
+    assert "--fps must be positive" in capsys.readouterr().err
+
+
+def test_record_preflight_treats_a_missing_camera_as_fatal(
+    fake_camera_bus, no_mesh_cache, capsys
+) -> None:
+    # Unlike `doctor`, recording with a view silently absent produces a dataset
+    # that is wrong rather than a cell that is merely unchecked.
+    fake_camera_bus(["254623070531"])  # top only; both wrists missing
+
+    status = cli.main(["record", "--dry-run", "--task", "t"])
+
+    assert status == 1
+    err = capsys.readouterr().err
+    assert "failed check(s); nothing was energized" in err
+
+
+def test_record_narrows_cameras_with_only(fake_camera_bus, monkeypatch, capsys) -> None:
+    fake_camera_bus(["254623070531", "254623070417"])
+    seen: dict[str, object] = {}
+
+    def fake_run(rig, **kwargs):
+        seen["cameras"] = rig.camera_names
+        seen["arms"] = rig.names
+        return 0
+
+    monkeypatch.setattr(cli, "run_record", fake_run)
+    cli.main(["record", "--dry-run", "--task", "t", "--only", "right"])
+
+    assert seen["arms"] == ("right",)
+    assert seen["cameras"] == ("top", "right_wrist")
+    del capsys
+
+
+def test_no_cameras_records_state_only(fake_camera_bus, monkeypatch) -> None:
+    fake_camera_bus([])
+    seen: dict[str, object] = {}
+
+    def fake_run(rig, **kwargs):
+        seen["cameras"] = rig.camera_names
+        return 0
+
+    monkeypatch.setattr(cli, "run_record", fake_run)
+    cli.main(["record", "--dry-run", "--task", "t", "--no-cameras", "--skip-preflight"])
+
+    assert seen["cameras"] == ()
+
+
+def test_record_runs_a_whole_session_on_fake_backends(fakes, capsys) -> None:
+    # The end-to-end path: power up, drive the arms, write episodes, park. The
+    # `hold` source exists exactly so this is possible without a headset.
+    factory, made = fakes
+    rig = resolve_rig("yam_bimanual").without_cameras()
+
+    status = cli.run_record(
+        rig,
+        task="a whole session",
+        repo_id=None,
+        teleop="hold",
+        fps=200,
+        hold_duration_s=0.05,
+        dry_run=True,
+        park=True,
+        backend_factory=factory(),
+    )
+
+    assert status == 0
+    out = capsys.readouterr().out
+    assert "1 episode(s)" in out
+    # Both arms were energized, commanded, and then parked at home_pos.
+    for backend in made.values():
+        assert backend.connects == 1
+        assert backend.commands
+        assert backend.closes[0] is True  # parked at home_pos on the way down
+
+
+def test_a_session_that_saved_nothing_is_a_failure(fakes, capsys) -> None:
+    # Exit status is what a wrapper script keys on: a session that produced no
+    # episode must not look like a success.
+    factory, made = fakes
+    stop = threading.Event()
+    stop.set()  # end before a single tick runs
+
+    status = cli.run_record(
+        resolve_rig("yam_bimanual").without_cameras(),
+        task="nothing",
+        repo_id=None,
+        teleop="hold",
+        dry_run=True,
+        backend_factory=factory(),
+        stop=stop,
+    )
+
+    assert status == 1
+    assert "no episode was saved" in capsys.readouterr().err
+    # And the arms still came down.
+    for backend in made.values():
+        assert not backend.connected
+
+
+def test_an_unknown_teleop_source_is_refused(fakes) -> None:
+    factory, _ = fakes
+
+    with pytest.raises(ConfigurationError, match="unknown teleop source"):
+        cli.run_record(
+            resolve_rig("yam_bimanual").without_cameras(),
+            task="t",
+            repo_id=None,
+            teleop="quest3",
+            dry_run=True,
+            backend_factory=factory(),
+        )
+
+
+def test_the_arms_come_down_even_when_the_session_raises(fakes) -> None:
+    # A recording session holds two energized arms; an exception on the way
+    # through must not leave them up.
+    factory, made = fakes
+
+    with pytest.raises(ConfigurationError):
+        cli.run_record(
+            resolve_rig("yam_bimanual").without_cameras(),
+            task="t",
+            repo_id=None,
+            teleop="nope",
+            dry_run=True,
+            backend_factory=factory(),
+        )
+
+    assert made
+    for backend in made.values():
+        assert not backend.connected
+
+
+# --------------------------------------------------------------------------- #
+# live camera preview
+# --------------------------------------------------------------------------- #
+
+
+def test_preview_names_the_cameras_it_could_not_open(tmp_path, monkeypatch, capsys) -> None:
+    """A missing camera is a line of output, not a refusal to energize.
+
+    ``record`` opens all-or-none because a dataset with a view silently absent
+    is corrupt. ``live`` exists to drive arms, so an unplugged wrist camera
+    costs you a tile, not the session.
+    """
+    from tests_helpers_cameras import fake_by_id  # noqa: PLC0415
+
+    from openpi_control import cameras as cameras_mod
+
+    rig = resolve_rig("yam_bimanual")
+    # Only the top camera is on this bus; both wrists are unplugged.
+    monkeypatch.setattr(
+        cameras_mod, "BY_ID_DIR", fake_by_id(tmp_path, [rig.cameras[0].serial])
+    )
+    opened = []
+
+    class _Reader:
+        def __init__(self, spec):
+            opened.append(spec.name)
+            self.spec = spec
+
+    monkeypatch.setattr(cameras_mod, "CameraReader", _Reader)
+
+    readers = cli.open_preview_cameras(rig)
+
+    assert opened == [rig.cameras[0].name]
+    assert set(readers) == {rig.cameras[0].name}
+    out = capsys.readouterr().out
+    for camera in rig.cameras[1:]:
+        assert f"{camera.name}" in out
+        assert "not on the bus" in out
+
+
+def test_preview_collapses_one_failure_shared_by_every_camera(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """No SDK installed is the same sentence three times; say it once."""
+    from tests_helpers_cameras import fake_by_id  # noqa: PLC0415
+
+    from openpi_control import cameras as cameras_mod
+
+    rig = resolve_rig("yam_bimanual")
+    monkeypatch.setattr(
+        cameras_mod, "BY_ID_DIR", fake_by_id(tmp_path, [c.serial for c in rig.cameras])
+    )
+
+    def refuse(spec):
+        raise ConfigurationError("reading a camera needs the RealSense SDK")
+
+    monkeypatch.setattr(cameras_mod, "CameraReader", refuse)
+
+    assert cli.open_preview_cameras(rig) == {}
+
+    out = capsys.readouterr().out
+    assert out.count("needs the RealSense SDK") == 1
+    for camera in rig.cameras:
+        assert camera.name in out
+
+
+def test_preview_keeps_the_cameras_that_do_open(tmp_path, monkeypatch, capsys) -> None:
+    """One busy camera must not cost the other two their tiles."""
+    from tests_helpers_cameras import fake_by_id  # noqa: PLC0415
+
+    from openpi_control import cameras as cameras_mod
+
+    rig = resolve_rig("yam_bimanual")
+    monkeypatch.setattr(
+        cameras_mod, "BY_ID_DIR", fake_by_id(tmp_path, [c.serial for c in rig.cameras])
+    )
+    busy = rig.cameras[1].name
+
+    class _Reader:
+        def __init__(self, spec):
+            if spec.name == busy:
+                raise ConfigurationError(f"cannot start camera {spec.name!r}: device busy")
+            self.spec = spec
+
+    monkeypatch.setattr(cameras_mod, "CameraReader", _Reader)
+
+    readers = cli.open_preview_cameras(rig)
+
+    assert set(readers) == {c.name for c in rig.cameras} - {busy}
+    assert "device busy" in capsys.readouterr().out
+
+
+def test_mirror_steps_a_camera_panel_on_the_pose_clock(fakes) -> None:
+    """One clock for poses, commands, and previews -- never three threads."""
+    factory, _ = fakes
+    rig = resolve_rig("yam_bimanual")
+    session, live_arms = cli.power_up(rig, backend_factory=factory())
+    steps: list[float] = []
+
+    class _Panel:
+        def step(self, dt: float) -> None:
+            steps.append(dt)
+            stop.set()
+
+    stop = threading.Event()
+    try:
+        cli.mirror(None, live_arms, stop=stop, rate_hz=100.0, cameras=_Panel())
+    finally:
+        session.close()
+
+    assert steps == [pytest.approx(0.01)]
+
+
+# --------------------------------------------------------------------------- #
+# CAN bitrate
+# --------------------------------------------------------------------------- #
+
+
+def test_bitrate_comes_from_sysfs_when_the_kernel_exposes_it(monkeypatch) -> None:
+    # The cheap path: no subprocess at all.
+    monkeypatch.setattr(cli, "_can_sysfs", lambda iface, leaf: "1000000")
+
+    def forbidden(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("sysfs answered; ip should not have been run")
+
+    monkeypatch.setattr(cli.subprocess, "run", forbidden)
+
+    assert cli.can_bitrate("can0") == 1000000
+
+
+def test_bitrate_falls_back_to_ip_when_sysfs_has_no_bittiming(monkeypatch) -> None:
+    # /sys/class/net/<if>/can_bittiming does not exist on every kernel -- it is
+    # absent on 6.8 -- which made this check warn on every run of a correctly
+    # configured 1 Mbit bus. A preflight that always warns is one nobody reads.
+    monkeypatch.setattr(cli, "_can_sysfs", lambda iface, leaf: None)
+    payload = json.dumps(
+        [{"linkinfo": {"info_kind": "can", "info_data": {"bittiming": {"bitrate": 1000000}}}}]
+    )
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=payload, stderr=""),
+    )
+
+    assert cli.can_bitrate("can0") == 1000000
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SimpleNamespace(returncode=1, stdout="", stderr="Device does not exist"),
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+        SimpleNamespace(returncode=0, stdout="not json", stderr=""),
+        SimpleNamespace(returncode=0, stdout="[{}]", stderr=""),
+        SimpleNamespace(returncode=0, stdout='[{"linkinfo": {}}]', stderr=""),
+    ],
+)
+def test_an_unreadable_bitrate_is_unknown_not_a_crash(monkeypatch, result) -> None:
+    # doctor must survive a non-CAN interface, an absent one, and an `ip` whose
+    # output shape changed -- reporting "unknown" rather than raising.
+    monkeypatch.setattr(cli, "_can_sysfs", lambda iface, leaf: None)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: result)
+
+    assert cli.can_bitrate("can0") is None
+
+
+def test_a_missing_ip_binary_is_survivable(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_can_sysfs", lambda iface, leaf: None)
+
+    def boom(*args, **kwargs):
+        raise FileNotFoundError("no ip")
+
+    monkeypatch.setattr(cli.subprocess, "run", boom)
+
+    assert cli.can_bitrate("can0") is None

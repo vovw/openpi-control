@@ -14,10 +14,11 @@ Two commands, both aimed at the jobs you do before an arm is usable:
     Destructive and pose-dependent, so it confirms before touching anything.
 
 ``live``
-    Bring a whole rig up, mirror it in the browser, then park it and put it
-    back down. This is the one command here that energizes an arm, and it owns
-    that lifecycle start to finish: ``pi_control_node`` dies with its parent
-    process, so an arm cannot outlive the command that powered it on.
+    Bring a whole rig up, mirror it in the browser -- arms and cameras on the
+    one page -- then park it and put it back down. This is the one command here
+    that energizes an arm, and it owns that lifecycle start to finish:
+    ``pi_control_node`` dies with its parent process, so an arm cannot outlive
+    the command that powered it on.
 
 ``cameras``
     Resolve the rig's cameras to device paths and say which ones are actually
@@ -34,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import subprocess
 import sys
 import threading
 import time
@@ -183,6 +185,43 @@ def _can_sysfs(interface: str, leaf: str) -> str | None:
         return None
 
 
+def can_bitrate(interface: str) -> int | None:
+    """The configured bitrate of a SocketCAN interface, or None if unknown.
+
+    Two sources, because neither is universal. ``/sys/class/net/<if>/
+    can_bittiming/bitrate`` is the cheap one, but it does not exist on every
+    kernel -- it is absent on 6.8 here, which made this check warn "interface
+    does not report one" on every single run of a correctly configured 1 Mbit
+    bus. A preflight that always warns is one nobody reads, so fall back to
+    ``ip``, which reads the same value over netlink and is where ``ip -d link
+    show`` gets it from.
+    """
+    from_sysfs = _can_sysfs(interface, "can_bittiming/bitrate")
+    if from_sysfs:
+        try:
+            return int(from_sysfs)
+        except ValueError:
+            pass
+    try:
+        completed = subprocess.run(
+            ["ip", "-d", "-json", "link", "show", interface],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return None
+    try:
+        links = json.loads(completed.stdout)
+        bitrate = links[0]["linkinfo"]["info_data"]["bittiming"]["bitrate"]
+    except (json.JSONDecodeError, LookupError, TypeError):
+        return None
+    return int(bitrate) if bitrate else None
+
+
 # --------------------------------------------------------------------------- #
 # doctor
 # --------------------------------------------------------------------------- #
@@ -271,7 +310,7 @@ def run_doctor(
             )
         )
         want = _catalog_baudrate(assets.model_config)
-        have = _can_sysfs(interface, "can_bittiming/bitrate")
+        have = can_bitrate(interface)
         if want is None:
             results.append(CheckResult(_WARN, "bitrate", "model declares no catalog baudrate"))
         elif have is None:
@@ -281,7 +320,7 @@ def run_doctor(
         else:
             results.append(
                 CheckResult(
-                    _OK if int(have) == want else _FAIL,
+                    _OK if have == want else _FAIL,
                     "bitrate",
                     f"{have} (model wants {want})",
                 )
@@ -410,6 +449,49 @@ def run_camera_checks(
                 "add them to YAM_BIMANUAL_CAMERA_SERIALS in rigs.py",
             )
         )
+    return results
+
+
+def check_camera_modes(rig: Rig) -> list[CheckResult]:
+    """Can each camera actually deliver the mode the run is asking for?
+
+    Kept out of :func:`run_camera_checks` because answering it needs the
+    RealSense SDK, and ``doctor`` must keep working on a box without it. This
+    only enumerates profiles -- it opens no stream -- so it is cheap enough to
+    sit in a preflight, and it turns "you asked for 45 fps" into the list of
+    rates the device has rather than a bare ioctl failure once the arms are
+    already energized.
+    """
+    results: list[CheckResult] = []
+    for camera in rig.cameras:
+        label, size = f"mode {camera.name}", f"{camera.width}x{camera.height}"
+        try:
+            modes = cameras_mod.supported_color_modes(camera.serial)
+        except ConfigurationError as err:
+            # Not connected, or no SDK. Either way the presence checks already
+            # said so; repeating it as a failure here would double-count.
+            results.append(CheckResult(_WARN, label, str(err)))
+            continue
+        rates = modes.get((camera.width, camera.height))
+        if rates is None:
+            offered = ", ".join(f"{w}x{h}" for w, h in modes) or "nothing"
+            detail = f"{size} is not offered; this camera has {offered}"
+        elif camera.fps not in rates:
+            detail = (
+                f"{camera.fps} fps at {size} is not offered; this camera does "
+                f"{', '.join(str(rate) for rate in rates)}"
+            )
+        else:
+            results.append(
+                CheckResult(
+                    _OK,
+                    label,
+                    f"{size}@{camera.fps} {camera.pixel_format} "
+                    f"(offers {', '.join(str(rate) for rate in rates)})",
+                )
+            )
+            continue
+        results.append(CheckResult(_FAIL, label, detail))
     return results
 
 
@@ -658,6 +740,46 @@ def power_down(session: ArmSession, live_arms: list[LiveArm], *, park: bool = Tr
     return failures
 
 
+def open_preview_cameras(
+    rig: Rig, *, overrides: dict[str, str] | None = None
+) -> dict[str, cameras_mod.CameraReader]:
+    """Open every camera of ``rig`` that can be opened, and say what was not.
+
+    Deliberately not the recorder's all-or-none open: a dataset with a view
+    silently missing is a corrupt dataset, but ``live`` exists to drive arms,
+    and refusing to energize them because someone unplugged a wrist camera --
+    or because another process is already streaming it -- would be the wrong
+    trade. Every camera that opens is previewed; every one that does not is
+    named.
+
+    Opened one at a time for the same reason ``--probe`` does it: the useful
+    error is "this camera is held by something else", and it has to name the
+    camera it is actually about. Identical failures are collapsed into one
+    line, because the common one -- no SDK installed -- is the same sentence
+    for all three.
+    """
+    discovery = cameras_mod.discover(rig.cameras, overrides=overrides)
+    for name, serial in discovery.missing.items():
+        pinned = (overrides or {}).get(name)
+        why = (
+            f"pinned device {pinned} does not exist"
+            if pinned
+            else f"serial {serial} not on the bus"
+        )
+        print(f"  camera   {name:<12} not previewing — {why}")
+
+    readers: dict[str, cameras_mod.CameraReader] = {}
+    problems: dict[str, list[str]] = {}
+    for name, found in discovery.matched.items():
+        try:
+            readers[name] = cameras_mod.CameraReader(found.spec())
+        except (ConfigurationError, OSError) as err:
+            problems.setdefault(str(err), []).append(name)
+    for message, names in problems.items():
+        print(f"  camera   {', '.join(names)} not previewing — {message}")
+    return readers
+
+
 def mirror(
     scene: object | None,
     live_arms: list[LiveArm],
@@ -665,6 +787,7 @@ def mirror(
     stop: threading.Event,
     rate_hz: float = _MIRROR_RATE_HZ,
     control: object | None = None,
+    cameras: object | None = None,
 ) -> None:
     """Pump each arm's newest pose into the scene until ``stop`` is set.
 
@@ -675,7 +798,10 @@ def mirror(
 
     A ``control`` panel is stepped on this same clock rather than on a thread
     of its own, so the pose that is drawn and the pose that is commanded are
-    always one tick apart at most, and the two can never interleave.
+    always one tick apart at most, and the two can never interleave. A
+    ``cameras`` panel rides the same clock for the same reason -- it throttles
+    itself down to a preview rate internally, so the images and the poses share
+    one websocket instead of racing for it.
     """
     period = 1.0 / rate_hz
     while not stop.is_set():
@@ -686,6 +812,8 @@ def mirror(
                     scene.update(entry.name, state.joints.position_rad)  # type: ignore[attr-defined]
         if control is not None:
             control.step(period)  # type: ignore[attr-defined]
+        if cameras is not None:
+            cameras.step(period)  # type: ignore[attr-defined]
         stop.wait(period)
 
 
@@ -696,6 +824,8 @@ def run_live(
     park: bool = True,
     visualize: bool = True,
     control: bool = False,
+    camera_preview: bool = True,
+    camera_overrides: dict[str, str] | None = None,
     port: int = 8080,
     mesh_dir: Path | None = None,
     rate_hz: float = _MIRROR_RATE_HZ,
@@ -722,9 +852,23 @@ def run_live(
         # render here belongs to the hardware. Browser control is a different
         # surface -- see viser_control, where the sliders are targets instead.
 
+    # Cameras before the motors, as in ``record``: opening them is what finds
+    # out a camera is held by another process, and finding that out with two
+    # arms already energized is worse. Unlike ``record`` it is not fatal here.
+    camera_readers: dict[str, cameras_mod.CameraReader] = {}
+    if scene is not None and camera_preview and rig.cameras:
+        camera_readers = open_preview_cameras(rig, overrides=camera_overrides)
+
     mode = "gravity float (backdrivable)" if float_mode else "holding"
-    session, live_arms = power_up(rig, float_mode=float_mode, backend_factory=backend_factory)
+    try:
+        session, live_arms = power_up(rig, float_mode=float_mode, backend_factory=backend_factory)
+    except BaseException:
+        # The capture threads are already running; nothing below will reach the
+        # finally that would have stopped them.
+        cameras_mod.close_readers(camera_readers)
+        raise
     panel = None
+    camera_panel = None
     failures = 0
     try:
         for entry in live_arms:
@@ -740,10 +884,22 @@ def run_live(
             }
             panel = RigControlPanel(scene, followers, float_mode=float_mode)  # type: ignore[arg-type]
             print(f"  control  {', '.join(followers)} — disarmed; arm each one in the browser")
+        if camera_readers and scene is not None:
+            from .viz import CameraPanel
+
+            camera_panel = CameraPanel(scene.server, camera_readers)
+            print(f"  cameras  {', '.join(camera_readers)} — live in the browser")
         if scene is not None:
             print(f"  viser    {scene.url}")
         print(f"ctrl-c to {'park at home_pos and ' if park else ''}power down")
-        mirror(scene, live_arms, stop=stop, rate_hz=rate_hz, control=panel)
+        mirror(
+            scene,
+            live_arms,
+            stop=stop,
+            rate_hz=rate_hz,
+            control=panel,
+            cameras=camera_panel,
+        )
     except KeyboardInterrupt:
         print()
     finally:
@@ -751,10 +907,185 @@ def run_live(
         # must not race a panel that is still pushing targets at them.
         if panel is not None:
             panel.disarm_all("session ending")
+        # Released before the park below, not after: parking takes seconds, and
+        # a camera left held for them is a camera the next command cannot open.
+        cameras_mod.close_readers(camera_readers)
         if scene is not None:
             scene.server.stop()
         failures = power_down(session, live_arms, park=park)
     return 1 if failures else 0
+
+
+# --------------------------------------------------------------------------- #
+# record
+# --------------------------------------------------------------------------- #
+
+
+def run_record(
+    rig: Rig,
+    *,
+    task: str,
+    repo_id: str | None,
+    teleop: str = "vr",
+    fps: int = 30,
+    num_episodes: int = 0,
+    hold_duration_s: float = 10.0,
+    root: Path | None = None,
+    dry_run: bool = False,
+    park: bool = True,
+    push_to_hub: bool = False,
+    private: bool = False,
+    camera_overrides: dict[str, str] | None = None,
+    vr_url: str | None = None,
+    vr_kit: Path | None = None,
+    yam_xml: str | None = None,
+    backend_factory: Callable[[RigArm], ArmBackend] | None = None,
+    stop: threading.Event | None = None,
+) -> int:
+    """Record teleoperated episodes from a rig into a LeRobot dataset.
+
+    The whole session lives inside this call for the same reason ``live`` does:
+    the native node dies with its parent, so returning from here is what
+    de-energizes the arms. The order of the teardown matters and is deliberate
+    -- the dataset is finalized on disk *before* the arms are parked, so an
+    interrupted shutdown still leaves a complete, loadable dataset; and an
+    upload happens *after* the arms are down, because a few hundred megabytes of
+    video takes minutes and there is no reason to hold motors energized for it.
+    """
+    from . import record as record_mod
+
+    stop = stop if stop is not None else threading.Event()
+    cameras: dict[str, object] = {}
+
+    # Cameras first: they need no motors, and finding out now that a camera is
+    # held by another process beats finding out with two arms energized.
+    if rig.cameras:
+        discovery = cameras_mod.discover(rig.cameras, overrides=camera_overrides)
+        if not discovery.complete:
+            missing = ", ".join(
+                f"{name} (serial {serial})" for name, serial in discovery.missing.items()
+            )
+            print(f"error: camera(s) not on the bus: {missing}", file=sys.stderr)
+            return 1
+        cameras = dict(cameras_mod.open_readers(discovery.specs()))
+        print(f"  cameras  {', '.join(cameras)}")
+
+    session = None
+    live_arms: list[LiveArm] = []
+    source = None
+    status = 0
+    try:
+        shapes = record_mod.camera_shapes(cameras)
+
+        session, live_arms = power_up(rig, float_mode=False, backend_factory=backend_factory)
+        # Followers only. A leader has no `command`, so handing one to the record
+        # loop would fail mid-session on a rig that has one -- and its pose is
+        # not what the dataset is about anyway.
+        arms = {entry.name: entry.arm for entry in live_arms if entry.rig_arm.is_follower}
+        if not arms:
+            raise ConfigurationError(
+                f"rig {rig.name!r} has no follower arms to record from"
+            )
+        for entry in live_arms:
+            print(
+                f"  {entry.name:<8} {entry.rig_arm.model} on {entry.rig_arm.interface}"
+                " — energized, holding"
+            )
+
+        dofs = {name: arm.capabilities.dof for name, arm in arms.items()}
+        state_names = record_mod.arm_feature_names(list(arms), dofs)
+        features = record_mod.build_features(state_names, shapes)
+
+        source = _build_teleop_source(
+            teleop,
+            dofs=dofs,
+            hold_duration_s=hold_duration_s,
+            vr_url=vr_url,
+            vr_kit=vr_kit,
+            yam_xml=yam_xml,
+        )
+        print(f"  teleop   {source.describe()}")
+
+        if dry_run:
+            sink: object = record_mod.MemorySink()
+            print("  dataset  --dry-run: nothing is written to disk")
+        else:
+            assert repo_id is not None  # guaranteed by the caller
+            sink = record_mod.LeRobotSink(
+                repo_id=repo_id,
+                fps=fps,
+                features=features,
+                robot_type=record_mod.rig_robot_type(rig),
+                root=root,
+                image_writer_threads=4 * len(cameras),
+            )
+            print(f"  dataset  {repo_id} at {sink.root}")
+        print(f"  schema   {len(state_names)}-dim state/action, {len(shapes)} camera(s)")
+        print(f"  task     {task!r}")
+        print()
+        if teleop == "vr":
+            print("  right B: start (or redo) an episode    left Y: save it")
+        print(f"  ctrl-c to {'park and ' if park else ''}power down")
+        print()
+
+        result = record_mod.record_session(
+            arms=arms,
+            source=source,
+            sink=sink,  # type: ignore[arg-type]
+            cameras=cameras,
+            task=task,
+            fps=fps,
+            num_episodes=num_episodes,
+            stop=stop,
+        )
+        print(f"\n{result.summary()}")
+        if result.episodes == 0:
+            status = 1
+            print("no episode was saved", file=sys.stderr)
+    finally:
+        if source is not None:
+            source.close()
+        cameras_mod.close_readers(cameras)  # type: ignore[arg-type]
+        if session is not None:
+            failures = power_down(session, live_arms, park=park)
+            status = status or (1 if failures else 0)
+
+    if push_to_hub and not dry_run and status == 0:
+        print(f"pushing {repo_id} to the Hub ({'private' if private else 'public'}) ...")
+        try:
+            sink.push_to_hub(private=private)  # type: ignore[union-attr]
+        except Exception as err:  # noqa: BLE001 - the dataset is already safe on disk
+            print(f"push failed: {type(err).__name__}: {err}", file=sys.stderr)
+            print("the local dataset is complete; retry the upload by hand", file=sys.stderr)
+            status = 1
+        else:
+            print(f"pushed: https://huggingface.co/datasets/{repo_id}")
+    return status
+
+
+def _build_teleop_source(
+    teleop: str,
+    *,
+    dofs: dict[str, int],
+    hold_duration_s: float,
+    vr_url: str | None,
+    vr_kit: Path | None,
+    yam_xml: str | None,
+):  # noqa: ANN202 - a TeleopSource
+    from . import record as record_mod
+
+    if teleop == "hold":
+        return record_mod.HoldSource(dofs, duration_s=hold_duration_s)
+    if teleop == "vr":
+        from .teleop_vr import DEFAULT_WS_URL, QuestTeleopSource
+
+        return QuestTeleopSource(
+            list(dofs),
+            ws_url=vr_url or DEFAULT_WS_URL,
+            kit_path=vr_kit,
+            model_path=yam_xml,
+        )
+    raise ConfigurationError(f"unknown teleop source {teleop!r}; use 'vr' or 'hold'")
 
 
 # --------------------------------------------------------------------------- #
@@ -861,6 +1192,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="add per-arm browser control: confirm the pose, Arm, then drive with sliders",
     )
+    live.add_argument(
+        "--no-cameras",
+        dest="camera_preview",
+        action="store_false",
+        help="skip the camera tiles, leaving the rig's cameras free for another process",
+    )
+    live.add_argument(
+        "--camera",
+        action="append",
+        metavar="NAME=DEVICE",
+        help="pin one camera to an explicit device, e.g. top=/dev/video4 (repeatable)",
+    )
     live.add_argument("--port", type=int, default=8080, help="viser HTTP port")
     live.add_argument(
         "--mesh-dir", type=Path, default=None, help="directory holding the URDF's meshes"
@@ -901,6 +1244,104 @@ def main(argv: list[str] | None = None) -> int:
         help="with --probe: write each grabbed frame to DIR/<name>.png",
     )
 
+    rec = sub.add_parser(
+        "record", help="teleoperate a rig and record the episodes as a LeRobot dataset"
+    )
+    rec.add_argument("--rig", default="yam_bimanual", help=f"one of: {', '.join(rig_names())}")
+    rec.add_argument(
+        "--only",
+        action="append",
+        metavar="ARM",
+        help="record one arm of the rig, which also drops the other wrist camera",
+    )
+    rec.add_argument(
+        "--interface",
+        action="append",
+        metavar="ARM=IFACE",
+        help="move one arm to a different bus, e.g. --interface left=can2 (repeatable)",
+    )
+    rec.add_argument(
+        "--camera",
+        action="append",
+        metavar="NAME=DEVICE",
+        help="pin one camera to an explicit device (repeatable)",
+    )
+    rec.add_argument(
+        "--repo-id",
+        default=None,
+        help="dataset id, e.g. you/yam-fold-towel. Required unless --dry-run",
+    )
+    rec.add_argument(
+        "--task",
+        default=None,
+        help="the language instruction stored on every frame; relabelling later "
+        "means rewriting the dataset, so set it",
+    )
+    rec.add_argument(
+        "--fps",
+        type=int,
+        default=30,
+        help="dataset, control-loop, and camera rate. The D405s here sustain 90 "
+        "at 848x480 with all three running; the arms publish at 200",
+    )
+    rec.add_argument(
+        "--camera-fps",
+        type=int,
+        default=None,
+        help="run the cameras at a different rate from the loop (default: --fps)",
+    )
+    rec.add_argument(
+        "--num-episodes",
+        type=int,
+        default=0,
+        help="end the session after this many saved episodes (0 = until ctrl-c)",
+    )
+    rec.add_argument("--root", type=Path, default=None, help="local dataset root")
+    rec.add_argument(
+        "--teleop",
+        choices=("vr", "hold"),
+        default="vr",
+        help="vr: drive from a Quest via vr-teleop-kit. hold: arms stay still for "
+        "--hold-seconds, to check the pipeline without a headset",
+    )
+    rec.add_argument(
+        "--hold-seconds",
+        type=float,
+        default=10.0,
+        help="episode length for --teleop hold",
+    )
+    rec.add_argument("--vr-url", default=None, help="relay WebSocket URL")
+    rec.add_argument(
+        "--vr-kit", type=Path, default=None, help="path to a vr-teleop-kit checkout"
+    )
+    rec.add_argument(
+        "--yam-xml", default=None, help="YAM MJCF the VR inverse kinematics loads"
+    )
+    rec.add_argument(
+        "--no-cameras",
+        dest="cameras_enabled",
+        action="store_false",
+        help="record state and action only",
+    )
+    rec.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run the whole session, including the arms, but write nothing to disk",
+    )
+    rec.add_argument(
+        "--no-park",
+        dest="park",
+        action="store_false",
+        help="de-energize where the arms stand instead of parking them first",
+    )
+    rec.add_argument(
+        "--skip-preflight", action="store_true", help="record without the doctor checks"
+    )
+    rec.add_argument(
+        "--push-to-hub", action="store_true", help="upload once the arms are down"
+    )
+    rec.add_argument("--private", action="store_true", help="with --push-to-hub, keep it private")
+
     args = parser.parse_args(argv)
     log_path = runlog.setup_run_logging(args.command)
 
@@ -909,6 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
         "zero": _command_zero,
         "live": _command_live,
         "cameras": _command_cameras,
+        "record": _command_record,
     }
     try:
         return commands[args.command](args, log_path)
@@ -1083,6 +1525,8 @@ def _command_live(args: argparse.Namespace, log_path: Path) -> int:
         park=args.park,
         visualize=args.visualize,
         control=args.control,
+        camera_preview=args.camera_preview,
+        camera_overrides=cameras_mod.parse_camera_overrides(args.camera),
         port=args.port,
         mesh_dir=args.mesh_dir,
     )
@@ -1117,6 +1561,90 @@ def _command_cameras(args: argparse.Namespace, log_path: Path) -> int:
     print(f"\n{len(results)} checks, {failures} failed, {warnings} warned")
     print(f"log: {log_path}")
     return 1 if failures else 0
+
+
+def _command_record(args: argparse.Namespace, log_path: Path) -> int:
+    if not args.dry_run and not args.repo_id:
+        raise ConfigurationError(
+            "record needs --repo-id (e.g. you/yam-fold-towel), or --dry-run to "
+            "rehearse the session without writing a dataset"
+        )
+    if args.fps <= 0:
+        raise ConfigurationError(f"--fps must be positive, got {args.fps}")
+
+    overrides = cameras_mod.parse_camera_overrides(args.camera)
+    rig = resolve_rig(args.rig).with_interfaces(_parse_interface_overrides(args.interface))
+    if args.only:
+        rig = rig.subset(args.only)
+    if not args.cameras_enabled:
+        rig = rig.without_cameras()
+    # The run's capture settings, applied once here so the preflight validates
+    # exactly the mode the recorder will open. Cameras run at the record rate:
+    # a loop at 90 Hz reading 30 fps cameras would write each frame three times
+    # and call it data. RGB straight from the SDK, because converting in numpy
+    # costs 4.1 ms of an 11.1 ms tick with three cameras (see record.to_rgb).
+    rig = rig.with_camera_capture(
+        fps=args.camera_fps or args.fps, pixel_format="rgb8"
+    )
+
+    # A dataset carries its task string on every frame, and relabelling means
+    # rewriting the dataset, so an unset --task is worth a word rather than a
+    # silent default that ends up in a thousand episodes.
+    task = args.task or "teleop"
+    if not args.task:
+        print("warning: no --task given; every frame will say 'teleop'", file=sys.stderr)
+
+    print(f"record: rig {rig.name} — {rig.description}")
+    for rig_arm in rig.arms:
+        print(f"  {rig_arm.name:<8} {rig_arm.model:<6} {rig_arm.interface}")
+
+    if not args.skip_preflight:
+        failures, reports = preflight_rig(rig)
+        camera_results = run_camera_checks(rig, overrides=overrides, required=True)
+        # Asking for a rate the camera does not have should fail here, not after
+        # two arms are energized and the first pipeline refuses to start.
+        camera_results += check_camera_modes(rig)
+        failures += sum(1 for result in camera_results if result.status == _FAIL)
+        for name, results in reports:
+            problems = [r for r in results if r.status != _OK]
+            if problems:
+                print(f"\npreflight {name}:")
+                for result in problems:
+                    print(result.render())
+        camera_problems = [r for r in camera_results if r.status != _OK]
+        if camera_problems:
+            print("\npreflight cameras:")
+            for result in camera_problems:
+                print(result.render())
+        if failures:
+            print(
+                f"\n{failures} failed check(s); nothing was energized. "
+                "Fix them, or re-run with --skip-preflight.",
+                file=sys.stderr,
+            )
+            return 1
+
+    print()
+    status = run_record(
+        rig,
+        task=task,
+        repo_id=args.repo_id,
+        teleop=args.teleop,
+        fps=args.fps,
+        num_episodes=args.num_episodes,
+        hold_duration_s=args.hold_seconds,
+        root=args.root,
+        dry_run=args.dry_run,
+        park=args.park,
+        push_to_hub=args.push_to_hub,
+        private=args.private,
+        camera_overrides=overrides,
+        vr_url=args.vr_url,
+        vr_kit=args.vr_kit,
+        yam_xml=args.yam_xml,
+    )
+    print(f"log: {log_path}")
+    return status
 
 
 if __name__ == "__main__":

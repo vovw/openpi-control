@@ -55,7 +55,24 @@ cameras = [
 # arms has no use for.
 lerobot = [
     "openpi-control[cameras]",
-    "lerobot>=0.4",
+    # The [dataset] extra is not optional for us: from lerobot 0.6 onwards
+    # importing LeRobotDataset without it raises ImportError for `datasets`,
+    # and LeRobotDataset is the whole point of this extra.
+    #
+    # Marked for 3.12+ because lerobot 0.6 requires it, while this project still
+    # supports 3.11 (trossen-arm publishes cp311 wheels). Without the marker the
+    # resolver fails outright on 3.11 rather than leaving the extra empty, which
+    # would make `uv sync` unusable there even for people who never record.
+    "lerobot[dataset]>=0.6; python_version >= '3.12'",
+]
+# Driving the arms from a Quest headset (openpi_control.teleop_vr). These are
+# vr-teleop-kit's own runtime dependencies -- its IK loads the YAM MJCF through
+# mujoco, and it reaches the relay over a WebSocket -- listed here because the
+# kit is a sibling checkout rather than a package we depend on, so nothing else
+# would install them. The kit itself comes from that checkout (--vr-kit).
+vr = [
+    "mujoco>=3.2",
+    "websockets>=13",
 ]
 
 [project.scripts]

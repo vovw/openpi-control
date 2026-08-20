@@ -435,6 +435,7 @@ def test_run_live_builds_the_panel_but_arms_nothing_by_itself() -> None:
     status = cli.run_live(
         resolve_rig("yam_bimanual"),
         control=True,
+        camera_preview=False,  # this is about the control panel, not the cell's cameras
         port=next(_PORT),
         backend_factory=factory,
         stop=stop,
@@ -443,3 +444,17 @@ def test_run_live_builds_the_panel_but_arms_nothing_by_itself() -> None:
     assert status == 0
     assert backends
     assert all(not backend.commands for backend in backends.values())
+
+
+def test_the_gripper_slider_is_labelled_the_way_the_node_reads_it(cell) -> None:
+    # The slider value goes straight into PositionCommand.effector, where the
+    # native effector treats normalized 1.0 as OPEN (its ready pose is
+    # from_normalized(1.0)). A label with the ends reversed invites an operator
+    # to close a gripper while believing they are opening it.
+    scene, followers, _ = cell()
+    panel = make_panel(scene, followers)
+
+    assert panel._effector_slider is not None
+    assert "0 closed" in panel._effector_slider.label
+    assert "1 open" in panel._effector_slider.label
+

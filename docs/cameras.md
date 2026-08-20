@@ -106,6 +106,35 @@ something else" — is not hidden behind two others complaining about USB
 bandwidth. A camera can only be streamed by one process at a time: a recorder
 and a browser preview cannot both have it.
 
+## In the browser
+
+`live` puts the same cameras on the viser page as the arms, one tile each under
+**Cameras**, which is the fastest way to check where a wrist is pointing while
+you drive it:
+
+```bash
+uv run openpi-control live --rig yam_bimanual --control
+uv run openpi-control live --no-cameras       # leave them free for a recorder
+```
+
+A tile is a preview, not a recording: 400 px wide at 10 Hz, against the 30 Hz
+the poses go out at. Pushing three 848x480 streams whole on the mirror clock
+would be ~35 MB/s of websocket to answer a question a thumbnail answers. A
+camera that is unplugged, or held by another process, is named on stdout and
+simply gets no tile — see [Cameras in the browser](cli.md#cameras-in-the-browser).
+
+`CameraPanel` in `openpi_control.viz` is the panel itself, and it takes readers
+that are *already open* — it never opens one. That is what keeps `viz` drawing
+and holding no device, so it stays importable on a box with no RealSense SDK:
+
+```python
+from openpi_control.viz import CameraPanel
+
+panel = CameraPanel(scene.server, readers)   # readers from open_readers()
+while running:
+    panel.step(dt)                           # throttles itself internally
+```
+
 ## Two measurements worth knowing
 
 Both of these were measured on this cell, and both are the reason the defaults
@@ -122,12 +151,20 @@ are what they are.
 If a policy wants a different size, crop or resize downstream — far cheaper
 there than in the camera.
 
+**848x480 also runs at 90 fps.** Every mode up to 848x480 offers 5/15/30/60/90;
+only 1280x720 caps at 30. All three cameras hold a true 90 fps concurrently
+(~220 MB/s over the shared USB 3 uplink, no drops). The rig declares 30 because
+that is the sane default for a dataset, and a run overrides it —
+`Rig.with_camera_capture(fps=..., pixel_format=...)`, which is what
+`openpi-control record --fps 90` does. `cameras.supported_color_modes(serial)`
+lists what a given camera offers without opening a stream.
+
 **The SDK, not OpenCV.** Capture goes through `pyrealsense2`. Reading the same
 colour node through `cv2.VideoCapture` tops out around 10–13 fps, while
 `v4l2-ctl` streams that node at a clean 30 — so the ceiling is in OpenCV's UVC
 consumer, not in the camera, the cable, or the bus (all three cameras are on
-USB 3 links here). Through the SDK all three hold 30 fps concurrently. OpenCV is
-still a dependency, but only to encode snapshots.
+USB 3 links here). Through the SDK all three hold a full 90 fps concurrently.
+OpenCV is still a dependency, but only to encode snapshots.
 
 If you record through some other tool, check its real frame rate before
 trusting the fps in its metadata.

@@ -11,6 +11,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+# The fake bus lives in its own module so test_cli can build one too, without
+# importing another test module for it.
+from tests_helpers_cameras import fake_by_id
+
 from openpi_control.cameras import (
     DEFAULT_COLOR_INDEX,
     DEFAULT_FPS,
@@ -23,27 +27,6 @@ from openpi_control.cameras import (
     present_serials,
 )
 from openpi_control.exceptions import ConfigurationError
-
-# The real thing, so that a change to the parsing regex is caught by a name in
-# the shape udev actually produces rather than a simplified stand-in.
-_BY_ID_TEMPLATE = (
-    "usb-Intel_R__RealSense_TM__Depth_Camera_405_"
-    "Intel_R__RealSense_TM__Depth_Camera_405_{serial}-video-index{index}"
-)
-
-
-# The six v4l2 nodes a D405 publishes, so the fake bus looks like the real one.
-_ALL_NODES = (0, 1, 2, 3, 4, 5)
-
-
-def fake_by_id(tmp_path, serials, *, indices=_ALL_NODES):
-    """A stand-in /dev/v4l/by-id holding all six nodes of each camera."""
-    by_id = tmp_path / "by-id"
-    by_id.mkdir()
-    for serial in serials:
-        for index in indices:
-            (by_id / _BY_ID_TEMPLATE.format(serial=serial, index=index)).touch()
-    return by_id
 
 
 def camera(name, serial, **kwargs):

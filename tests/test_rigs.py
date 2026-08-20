@@ -217,3 +217,35 @@ def test_a_camera_cannot_ride_on_an_arm_the_rig_does_not_have() -> None:
                 RigCamera(name="wrist", serial="1", label="W", arm="lfet"),
             ),
         )
+
+
+def test_camera_capture_settings_are_a_property_of_the_run() -> None:
+    # Rate and pixel format belong to a run, not to the cell: a recorder wants
+    # the fastest the cameras will go and RGB straight from the SDK, a browser
+    # preview wants neither.
+    rig = resolve_rig("yam_bimanual")
+    assert {c.fps for c in rig.cameras} == {30}
+    assert {c.pixel_format for c in rig.cameras} == {"bgr8"}
+
+    fast = rig.with_camera_capture(fps=90, pixel_format="rgb8")
+
+    assert {c.fps for c in fast.cameras} == {90}
+    assert {c.pixel_format for c in fast.cameras} == {"rgb8"}
+    # Serials, roles, and arm bindings are untouched.
+    assert fast.camera_names == rig.camera_names
+    assert [c.arm for c in fast.cameras] == [c.arm for c in rig.cameras]
+    # And the rig itself is unchanged -- these are copies.
+    assert {c.fps for c in rig.cameras} == {30}
+
+
+def test_with_camera_capture_can_change_one_setting_alone() -> None:
+    rig = resolve_rig("yam_bimanual").with_camera_capture(fps=60)
+
+    assert {c.fps for c in rig.cameras} == {60}
+    assert {c.pixel_format for c in rig.cameras} == {"bgr8"}
+    assert rig.with_camera_capture() is not None  # no-op is allowed
+
+
+def test_an_unsupported_pixel_format_is_refused() -> None:
+    with pytest.raises(ConfigurationError, match="pixel format"):
+        resolve_rig("yam_bimanual").with_camera_capture(pixel_format="yuyv")
