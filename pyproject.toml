@@ -7,7 +7,10 @@ name = "openpi-control"
 version = "0.1.5"
 description = "OpenPI native control runtime for YAM, ARX, and FR3 robot arms"
 readme = "README.md"
-requires-python = ">=3.11"
+# Capped below 3.14: trossen-arm is hard-pinned to ==1.10.0 to stay aligned
+# with the C++ libtrossen_arm in scripts/build_deps.sh, and that release
+# only publishes cp311/cp312/cp313 wheels.
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "OpenPI Control maintainers" }]
 dependencies = [
   "numpy>=1.26",
@@ -31,6 +34,33 @@ dev = [
   "pytest-cov>=5",
   "ruff>=0.6",
 ]
+# Browser visualization of the packaged models (openpi_control.viz). Kept
+# optional: it pulls trimesh/scipy and is never needed to drive an arm.
+viz = [
+    "viser>=1.0",
+    "yourdfpy>=0.0.56",
+]
+# Reading the cell's RealSense colour streams (openpi_control.cameras).
+# Discovery -- "is the top camera plugged in" -- is stdlib only and needs none
+# of this; capture is what wants the SDK. pyrealsense2 rather than OpenCV's
+# V4L2 path because it is the only one of the two that reaches 30 fps on a
+# D405 (openpi_control.cameras.CameraReader explains the measurement). OpenCV
+# stays for encoding snapshots -- headless, since nothing here opens a window.
+cameras = [
+    "pyrealsense2>=2.55",
+    "opencv-python-headless>=4.10",
+]
+# Recording teleop into a LeRobot dataset (openpi_control.record). Split from
+# `cameras` because lerobot drags in torch, which a robot box that only drives
+# arms has no use for.
+lerobot = [
+    "openpi-control[cameras]",
+    "lerobot>=0.4",
+]
+
+[project.scripts]
+openpi-control = "openpi_control.cli:main"
+openpi-control-viz = "openpi_control.viz:main"
 
 [tool.scikit-build]
 cmake.version = ">=3.22"
