@@ -207,6 +207,14 @@ int main(int argc, char** argv) {
         int capability_flags = PI_CONTROL_CAP_MOVE_TO_READY;
         if (cla.role == Role::FOLLOWER) {
             capability_flags |= PI_CONTROL_CAP_DIRECT_COMMAND | PI_CONTROL_CAP_LIVE_INPUT;
+            // The calibration gravity float is a follower's, not a leader's (see
+            // DeviceArm::supports_gravity_float), so it has to be advertised on this
+            // branch too. Without it a client asking a follower rig to float finds the
+            // flag clear, skips the request, and leaves both arms stiff -- the flag
+            // predates follower float and only ever meant the leader's kind.
+            if (p_device->supports_gravity_float()) {
+                capability_flags |= PI_CONTROL_CAP_GRAVITY_COMP;
+            }
         } else if (p_device->is_read_only()) {
             // Read-only leader (passive encoders, e.g. ARX_ENC): cannot produce torque,
             // so gravity compensation and force feedback are not available. The arm

@@ -93,8 +93,9 @@ ReturnCode DeviceArm::set_runtime_gravity_float(bool enabled, float abort_drift_
         return ReturnCode::SUCCESS;
     }
     if (enabled) {
-        if (!p_algo_) {
-            PI_ERROR("%s_%s: gravity float needs a gravity-capable algo (URDF-backed); none is initialized",
+        if (!supports_gravity_float()) {
+            PI_ERROR("%s_%s: gravity float needs a streamable torque feed-forward (MIT-mode CAN) and a "
+                     "URDF-backed gravity model; this arm does not offer both",
                      model_.c_str(), id_.c_str());
             return ReturnCode::NOT_SUPPORTED;
         }

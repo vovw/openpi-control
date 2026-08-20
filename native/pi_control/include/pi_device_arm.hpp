@@ -205,6 +205,20 @@ class DeviceArm : public Device {
      */
     virtual bool supports_torque_feed_forward() const { return false; }
 
+    /*!
+     * @brief Whether this arm can drop to the gravity feed-forward alone.
+     *
+     * Follower-only, which is the opposite of what the name suggests: pi_topic routes
+     * ENTER_GRAVITY_COMPENSATION on a follower into set_runtime_gravity_float(), while a
+     * leader floats by disengaging force feedback instead. Streaming that feed-forward
+     * needs MIT-mode torque on the bus and a URDF-backed dynamics model, so a serial
+     * (position-only) arm and a controller arm that compensates internally both say no.
+     */
+    bool supports_gravity_float() const override {
+        return role_ == Role::FOLLOWER && supports_torque_feed_forward() && p_algo_ != nullptr &&
+               p_algo_->has_gravity_model();
+    }
+
    protected:
     /*!
      * @brief Reads current hardware values from all joints and servos.
