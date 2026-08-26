@@ -59,6 +59,7 @@ class DeviceConfig {
     const std::string fn_effector_dist_to_torque_const        = "dist_to_torque_const"; ///< Field name for effector distance to torque constant.
     const std::string fn_effector_grip_spring_offset           = "grip_spring_offset"; ///< Field name for the torque-mode spring offset (rad), subtracted from the position error. Optional; default 0.
     const std::string fn_effector_open_at_min                = "open_at_min";    ///< Field name to specify the open side is at min position. (default is false)
+    const std::string fn_effector_needs_calibration          = "needs_calibration"; ///< Field name to measure the gripper's stops at every startup instead of trusting configured ones. (default is false)
 
 
     const std::string fn_topic_type      = "topic_type";  ///< Field name for topic type.

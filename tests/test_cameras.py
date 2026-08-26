@@ -209,3 +209,68 @@ def test_camera_overrides_parse_like_interface_overrides() -> None:
 def test_a_malformed_camera_override_is_refused(bad) -> None:
     with pytest.raises(ConfigurationError, match="NAME=DEVICE"):
         parse_camera_overrides([bad])
+
+
+def test_a_serialless_by_id_name_is_not_read_as_a_camera(tmp_path) -> None:
+    """A D435 with no USB serial must not be parsed into a camera called "435".
+
+    Its udev name ends in the model number where a D405's ends in the serial
+    (``..._Depth_Camera_435_..._Depth_Camera_435-video-index0``), and a lazy
+    pattern reads that as serial ``435`` -- inventing a camera that is not there
+    and, worse, claiming to have found the one that is.
+    """
+    by_id = tmp_path / "by-id"
+    by_id.mkdir()
+    for index in (0, 1, 2, 3):
+        (
+            by_id
+            / (
+                "usb-Intel_R__RealSense_TM__Depth_Camera_435_"
+                f"Intel_R__RealSense_TM__Depth_Camera_435-video-index{index}"
+            )
+        ).touch()
+
+    assert present_serials(by_id) == {}
+
+
+def test_a_camera_udev_cannot_name_is_found_through_the_sdk(tmp_path, monkeypatch) -> None:
+    """Discovery falls back to the SDK for a camera with no by-id entry.
+
+    Device paths are diagnostics here -- streams are opened by SDK serial -- so
+    a camera the SDK can address is present even when udev cannot name it.
+    """
+    from openpi_control import cameras as cameras_mod
+
+    by_id = fake_by_id(tmp_path, ["254623070863"])
+    # The real system directory is what enables the SDK fallback; a redirected
+    # bus is taken literally, so point BY_ID_DIR at the fake and pass no dir.
+    monkeypatch.setattr(cameras_mod, "BY_ID_DIR", by_id)
+    monkeypatch.setattr(cameras_mod, "SYSTEM_BY_ID_DIR", by_id)
+    monkeypatch.setattr(
+        cameras_mod, "sdk_present_asic_serials", lambda: {"348523020354": "243622071623"}
+    )
+
+    result = discover([camera("top", "348523020354"), camera("left_wrist", "254623070863")])
+
+    assert result.complete
+    assert result.matched["top"].device == "sdk:243622071623"
+    assert result.matched["left_wrist"].device.endswith("video-index4")
+    assert result.unclaimed == ()
+
+
+def test_a_redirected_bus_is_taken_literally(tmp_path, monkeypatch) -> None:
+    """Pointing discovery at a directory means that directory is the whole bus.
+
+    Otherwise whatever happens to be plugged into the machine running the tests
+    decides whether a camera is "missing".
+    """
+    from openpi_control import cameras as cameras_mod
+
+    def _boom():  # pragma: no cover - must never be called
+        raise AssertionError("the SDK must not be consulted behind a redirected bus")
+
+    monkeypatch.setattr(cameras_mod, "sdk_present_asic_serials", _boom)
+
+    result = discover([camera("top", "348523020354")], by_id_dir=fake_by_id(tmp_path, []))
+
+    assert result.missing == {"top": "348523020354"}

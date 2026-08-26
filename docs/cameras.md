@@ -6,7 +6,7 @@ do, so `doctor --rig`, `cameras`, and anything that records agree on what
 `left_wrist` means.
 
 ```bash
-uv sync --extra cameras
+uv sync
 uv run openpi-control cameras                # what is plugged in, and where
 uv run openpi-control cameras --probe        # also open each one and measure it
 ```
@@ -18,15 +18,53 @@ USB port you used, and with how many cameras came up first. So a rig pins each
 view by serial number, and `openpi_control.cameras` resolves that to a device
 at run time:
 
-| Camera | Serial | Rides on | Sees |
-| --- | --- | --- | --- |
-| `top` | `254623070531` | — | the whole cell, from above |
-| `left_wrist` | `254623070863` | `left` | what the left gripper is about to touch |
-| `right_wrist` | `254623070417` | `right` | the same, for the right arm |
+| Camera | Model | Serial | Capture | Rides on | Sees |
+| --- | --- | --- | --- | --- | --- |
+| `top` | D435 | `348523020354` | 640x480@30 | — | the whole cell, from above |
+| `left_wrist` | D405 | `254623070863` | 848x480@30 | `left` | what the left gripper is about to touch |
+| `right_wrist` | D405 | `254623070417` | 848x480@30 | `right` | the same, for the right arm |
 
-These are the serials the cell was already using — they match `cams.env` in
-`vr-teleop-kit`. Swap a camera and the one place to edit is
+The wrist serials are the ones the cell was already using — they match
+`cams.env` in `vr-teleop-kit`. Swap a camera and the one place to edit is
 `YAM_BIMANUAL_CAMERA_SERIALS` in `openpi_control/rigs.py`.
+
+### The top camera is a D435, and it is not interchangeable
+
+It replaced a D405 (`254623070531`), and it differs in two ways the rig has to
+carry rather than paper over:
+
+- **It publishes no serial in its USB descriptor.** Its udev names end in the
+  model number where a D405's end in the serial, and its colour node gets no
+  `/dev/v4l/by-id` entry at all. Discovery therefore falls back to
+  `sdk_present_asic_serials()` for cameras udev cannot name; the SDK addresses
+  it perfectly well, and device paths here are only ever diagnostics — a stream
+  is opened by serial. Such a camera shows up as `sdk:<sdk-serial>` in the
+  `cameras` table instead of a `/dev/...` path.
+- **It came up on USB 2.0, and captures 640x480@30 because of it.** Enumerated
+  on 2026-08-23 it offered only 424x240, 640x480, 1280x720@15 and 1920x1080@8 —
+  the reduced set a D435 falls back to on USB 2. A USB 3 D435 also has
+  848x480@30, which is the rig default and what the wrists run. So
+  `YAM_TOP_CAPTURE` in `rigs.py` is a workaround with an expiry date: re-seat
+  the camera on a USB 3 port, re-run `openpi-control cameras`, and delete the
+  override once 848x480@30 shows up. All three cameras do hold a full 30 fps
+  together as configured.
+
+  The aspect ratio is the reason to bother. MolmoAct2's training frames are
+  640x360 and the D405 wrists are 848x480 — both 16:9. 640x480 is 4:3, so the
+  top view is currently the one input whose shape does not match what the
+  policy was trained on.
+
+The checkpoint itself was trained with a D435 in the top role, so the camera
+*model* is a move toward the training setup rather than away from it — note
+that the reference deployment on this cell had a D405 there
+(`front_camera: 352122273221` in `~/molmoact2/examples/yam/configs/yam_left.yaml`,
+which is the SDK serial for ASIC `254623070531`), so the reference is not the
+authority on this one.
+
+What the swap does not fix: `YAM_TOP_CAMERA_EXTRINSIC` still describes where
+the old camera sat, so the top-camera frame in the Viser scene is wrong until
+it is recalibrated. That is visualization metadata only — no capture or policy
+path reads it.
 
 Naming the arm a wrist camera rides on is what makes `--only` do the obviously
 right thing:

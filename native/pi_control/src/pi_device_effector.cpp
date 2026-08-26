@@ -13,6 +13,25 @@
 
 #define FORCE_FEEDBACK_TORQUE_FILTER_BUFFER_SIZE 5
 
+// Startup gripper-stop probe, i2rt's detect_gripper_limits defaults. The
+// torque is deliberately far below grip_torque_limit: this only has to walk
+// the jaws onto a stop they are already near, not to grip anything.
+#define GRIPPER_CALIBRATION_TORQUE_NM          0.2f
+#define GRIPPER_CALIBRATION_MAX_DURATION_S     2.0f
+#define GRIPPER_CALIBRATION_CHECK_INTERVAL_S   0.1f
+#define GRIPPER_CALIBRATION_POS_THRESHOLD_RAD  0.01f
+#define GRIPPER_CALIBRATION_STABLE_SAMPLES     3
+// A stroke shorter than this means the probe never reached both stops -- the
+// jaws are blocked, or something is holding them. Installing that as the
+// normalized range would map the whole of [0, 1] onto a few degrees of
+// travel, so it is refused and the configured range is kept instead.
+#define GRIPPER_CALIBRATION_MIN_STROKE_RAD     1.0f
+// How far either side of the starting pose the probe is allowed to travel
+// while the configured range is lifted. Wider than any single-turn stroke, so
+// a gripper longer than one feedback turn still fits, and bounded so a runaway
+// still trips the position guard rather than winding up forever.
+#define GRIPPER_CALIBRATION_PROBE_WINDOW_RAD   8.0f
+
 DeviceEffector::DeviceEffector(const CommandLineArgs& cla) : Device(cla) {
     type_ = DeviceType::EFFECTOR;
 }
@@ -246,6 +265,12 @@ ReturnCode DeviceEffector::start(int baud_rate) {
         }
     }
 
+    return_code = calibrate_gripper_limits();
+    if (return_code != ReturnCode::SUCCESS) {
+        PI_ERROR("Failed to calibrate gripper limits during start");
+        return fail_after_partial_start(return_code);
+    }
+
     return_code = move_to_ready_position();
     if (return_code != ReturnCode::SUCCESS) {
         PI_ERROR("Failed to move effector to ready position");
@@ -437,6 +462,33 @@ ReturnCode DeviceEffector::init(const CommandLineArgs& cla, int argc,
     }
     PI_INFO("DeviceEffector", InfoLevel::HELPFUL_1, "%s_%s: open_at_min=%d",
             model_.c_str(), id_.c_str(), open_at_min_);
+
+    return_code = p_config_individual_->get_field_value(
+        p_config_individual_->values_,
+        p_config_individual_->fn_effector_needs_calibration, needs_calibration_);
+    if (return_code != ReturnCode::SUCCESS) {
+        return_code = p_config_model_->get_field_value(
+            p_config_model_->values_,
+            p_config_model_->fn_effector_needs_calibration, needs_calibration_);
+        if (return_code != ReturnCode::SUCCESS) {
+            needs_calibration_ = false;
+        }
+    }
+    if (needs_calibration_) {
+        PI_INFO("DeviceEffector", InfoLevel::ESSENTIAL_0,
+                "%s_%s: needs_calibration set; the gripper stops are measured at startup",
+                model_.c_str(), id_.c_str());
+        // Before the first feedback sample lands, so the accumulator seeds on
+        // it: the startup one-shot wrap cannot resolve a stroke longer than
+        // one turn, and the calibration below is what gives the accumulated
+        // frame its meaning.
+        for (auto& p_joint : joints_) {
+            Servo* p_servo = p_joint->get_reference_servo();
+            if (p_servo != nullptr) {
+                p_servo->enable_turn_tracking();
+            }
+        }
+    }
 
     std::string control_mode_str;
     return_code = p_config_individual_->get_field_value(
@@ -976,6 +1028,136 @@ ReturnCode DeviceEffector::apply_action(const MsgJoints& msg) {
     }
 
     return return_code;
+}
+
+ReturnCode DeviceEffector::calibrate_gripper_limits() {
+    if (needs_calibration_ == false || is_read_only() == true) {
+        return ReturnCode::SUCCESS;
+    }
+    if (joints_.empty() || joints_.front() == nullptr) {
+        PI_ERROR("No joints found in effector; cannot calibrate gripper limits");
+        return ReturnCode::NOT_INITIALIZED;
+    }
+    Joint* p_joint = joints_.front().get();
+    const int16_t sid = p_joint->reference_servo_id();
+    if (sid >= 0 && failed_joint_ids_snapshot().count(sid) != 0) {
+        // A servo that already failed enable is not going to answer a torque
+        // probe, and driving one that is half-alive is worse than keeping the
+        // configured range. Not fatal: start() has its own verdict on it.
+        PI_WARN("%s_%s: skipping gripper calibration, servo id=%d already failed",
+                model_.c_str(), id_.c_str(), static_cast<int>(sid));
+        return ReturnCode::SUCCESS;
+    }
+
+    ReturnCode return_code = read_hardware_values();
+    if (return_code != ReturnCode::SUCCESS) {
+        PI_ERROR("%s_%s: cannot read the gripper before calibrating it",
+                 model_.c_str(), id_.c_str());
+        return return_code;
+    }
+
+    const float start_pos = p_joint->get_pos_rad_relative();
+    float min_pos = start_pos;
+    float max_pos = start_pos;
+    PI_INFO("DeviceEffector", InfoLevel::ESSENTIAL_0,
+            "%s_%s: calibrating gripper stops from %.3f rad (+-%.2f Nm probe)",
+            model_.c_str(), id_.c_str(), start_pos, GRIPPER_CALIBRATION_TORQUE_NM);
+
+    // The probe deliberately drives past the configured range -- finding out
+    // that the configured range is wrong is the entire point -- and
+    // Servo::read_hardware_values faults a joint that leaves it. So the range
+    // is opened up for the duration and either replaced by what was measured
+    // or put back exactly as it was.
+    const float saved_pos_min = p_joint->get_pos_min_relative();
+    const float saved_pos_max = p_joint->get_pos_max_relative();
+    p_joint->set_pos_min_relative(start_pos - GRIPPER_CALIBRATION_PROBE_WINDOW_RAD);
+    p_joint->set_pos_max_relative(start_pos + GRIPPER_CALIBRATION_PROBE_WINDOW_RAD);
+    auto restore_configured_range = [&]() {
+        p_joint->set_pos_min_relative(saved_pos_min);
+        p_joint->set_pos_max_relative(saved_pos_max);
+    };
+
+    const int max_samples = static_cast<int>(GRIPPER_CALIBRATION_MAX_DURATION_S /
+                                             GRIPPER_CALIBRATION_CHECK_INTERVAL_S);
+    const useconds_t interval_us =
+        static_cast<useconds_t>(GRIPPER_CALIBRATION_CHECK_INTERVAL_S * 1e6f);
+    const int directions[2] = {1, -1};
+
+    for (int index = 0; index < 2; index++) {
+        const int direction = directions[index];
+        int stable_count = 0;
+        bool have_last = false;
+        float last_pos = 0.0f;
+
+        for (int sample = 0; sample < max_samples; sample++) {
+            return_code =
+                p_joint->apply_torque(direction * GRIPPER_CALIBRATION_TORQUE_NM);
+            if (return_code != ReturnCode::SUCCESS) {
+                PI_ERROR("%s_%s: gripper probe torque rejected (rc=%d)", model_.c_str(),
+                         id_.c_str(), static_cast<int>(return_code));
+                break;
+            }
+            usleep(interval_us);
+            if (read_hardware_values() != ReturnCode::SUCCESS) {
+                PI_WARN("%s_%s: lost the gripper mid-probe; keeping what was measured",
+                        model_.c_str(), id_.c_str());
+                break;
+            }
+            const float pos = p_joint->get_pos_rad_relative();
+            min_pos = std::min(min_pos, pos);
+            max_pos = std::max(max_pos, pos);
+            if (have_last &&
+                fabsf(pos - last_pos) < GRIPPER_CALIBRATION_POS_THRESHOLD_RAD) {
+                stable_count++;
+                if (stable_count >= GRIPPER_CALIBRATION_STABLE_SAMPLES) {
+                    PI_INFO("DeviceEffector", InfoLevel::HELPFUL_1,
+                            "%s_%s: gripper stop found at %.3f rad (direction %+d)",
+                            model_.c_str(), id_.c_str(), pos, direction);
+                    break;
+                }
+            } else {
+                stable_count = 0;
+            }
+            last_pos = pos;
+            have_last = true;
+        }
+
+        // Let go before reversing, so the jaws are not fighting the previous
+        // direction while the next probe reads its first sample.
+        p_joint->apply_torque(0.0f);
+        usleep(interval_us * 3);
+        read_hardware_values();
+    }
+
+    p_joint->apply_torque(0.0f);
+
+    const float stroke = max_pos - min_pos;
+    if (stroke < GRIPPER_CALIBRATION_MIN_STROKE_RAD) {
+        restore_configured_range();
+        PI_ERROR(
+            "%s_%s: gripper calibration measured only %.3f rad of travel "
+            "([%.3f, %.3f]); the jaws are blocked or the probe torque is too "
+            "low. Keeping the configured range -- the gripper will not be "
+            "trustworthy this session",
+            model_.c_str(), id_.c_str(), stroke, min_pos, max_pos);
+        return ReturnCode::SUCCESS;
+    }
+
+    const float closed = open_at_min_ ? max_pos : min_pos;
+    const float open_pos = open_at_min_ ? min_pos : max_pos;
+    return_code = p_joint->set_normalized_position_range(closed, open_pos);
+    if (return_code != ReturnCode::SUCCESS) {
+        restore_configured_range();
+        return return_code;
+    }
+    p_joint->set_pos_min_relative(min_pos);
+    p_joint->set_pos_max_relative(max_pos);
+
+    PI_INFO("DeviceEffector", InfoLevel::ESSENTIAL_0,
+            "%s_%s: gripper calibrated: closed=%.3f rad, open=%.3f rad, "
+            "stroke=%.3f rad (normalized 0.0 -> %.3f, 1.0 -> %.3f)",
+            model_.c_str(), id_.c_str(), closed, open_pos, stroke, closed, open_pos);
+    return ReturnCode::SUCCESS;
 }
 
 ReturnCode DeviceEffector::move_to_ready_position() {

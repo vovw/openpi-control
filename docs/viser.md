@@ -9,10 +9,11 @@ It opens no CAN, serial, Ethernet, or Modbus connection and starts no
 
 ## Install
 
-The dependencies are optional — nothing here is needed to drive an arm:
+Its dependencies are an optional extra -- nothing here is needed to drive an
+arm -- but they are in the default `cell` group, so a plain sync installs them:
 
 ```bash
-uv sync --extra viz
+uv sync
 ```
 
 ## Getting the real arm
@@ -30,9 +31,11 @@ the run logs. Every later run finds them automatically and needs no network, so
 the real arm is the default with no flags. Provenance, including the pinned
 upstream revision, is written to `SOURCE.txt` next to the meshes.
 
-i2rt does not publish `link_6_visual.stl` / `link_6_collision.stl` — its own
-`yam.urdf` references them too. The wrist link therefore renders without
-geometry; the gap is reported on startup and in the GUI rather than left silent.
+i2rt keeps the wrist geometry with its crank gripper rather than with the arm,
+so `link_6_visual.stl` / `link_6_collision.stl` are not in the assets directory
+the other twelve meshes come from — both are fetched from the gripper model
+instead. A mesh that is genuinely absent is reported on startup and in the GUI
+rather than left silent, and that link renders bare.
 
 ## Standalone viewer
 
@@ -101,9 +104,44 @@ the session use for that arm. Each arm gets its own tint so a two-arm scene
 stays readable, and `ArmSpec` is still there for a scene the packaged rigs do
 not cover.
 
+The packaged `yam_bimanual` scene also shows the supplied calibrated `top`
+camera frame. Its pose is the camera-to-midpoint transform from
+`openpi_control.camera_poses`; the inverse and RPY values are derived from the
+same rigid transform. The wrist-camera frames are intentionally not drawn
+until their extrinsics are calibrated.
+
 To mirror two *live* arms rather than sliders, use `openpi-control live` — it
 owns the power-on and power-off that a live view implies. See
 [docs/cli.md](cli.md#live).
+
+## Colour and theme
+
+Every page this package serves asks viser for **dark mode**, because every
+colour in the scene was picked against a dark canvas and several of them do not
+survive the white one viser serves by default:
+
+| | on dark | on viser's default white |
+| --- | --- | --- |
+| amber axis markers | 8.6:1 | **2.0:1** |
+| camera-tile placeholder | 1.1:1 (recedes, as intended) | **15.9:1** (a black hole in a white page) |
+| left arm, blue `(92,132,186)` | 4.5:1 | 3.8:1 |
+| right arm, amber `(238,172,86)` | 8.8:1 | 2.3:1 |
+
+The two arm tints are blue and amber — the pair that survives the common
+red-green colour-blindnesses — and they are separated by **lightness** as well
+as hue, landing 66/255 apart in greyscale. That matters because the predicted
+chunk trails are translucent and overlap: hue alone stops being a distinction
+where two trails cross, and disappears entirely in a greyscale screenshot. The
+earlier amber was 13/255 from the blue, which is one colour to anyone not seeing
+hue.
+
+The GUI accent is a teal `(96,165,168)` that is deliberately *not* an arm tint,
+so a highlighted slider never reads as "the left arm". The share button is off:
+it publishes the page through viser's relay, and these pages show a live robot
+cell.
+
+Only pages this package creates are themed. Hand `ArmVisualizer` or
+`ArmSceneVisualizer` your own `server=` and its chrome stays yours.
 
 ## Driving it from a live arm
 

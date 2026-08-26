@@ -15,6 +15,9 @@
         "need_repeated_command": true
     },
 
+    "//needs_calibration": "The linear_4310's stroke (i2rt measures 6.57 rad) is longer than the DM4310's single feedback turn (6.283), so the open and closed ends alias onto nearly the same reading and no configured range can resolve them. The stops are measured at every startup instead, exactly as i2rt does (linear_4310.yml ships gripper_limits: null). normalized_pos_min/max below stay as the fallback for a probe that cannot reach both stops.",
+    "needs_calibration": true,
+
     "joint_init_sequence": [3, 2, 5, 4, 1, 6],
     "joints": [
         {

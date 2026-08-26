@@ -10,7 +10,7 @@ extra needs **Python 3.12+**, so on 3.11 it resolves to nothing and `record`
 says so rather than failing obscurely.
 
 ```bash
-uv sync --extra lerobot
+uv sync --extra lerobot   # torch, on top of the default set
 vr-teleop-relay                        # in the vr-teleop-kit checkout
 
 uv run openpi-control record \

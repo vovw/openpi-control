@@ -475,6 +475,101 @@ def test_gripper_polarity_command_round_trip_and_ready_pose(fake_bus_with_grippe
         )
 
 
+def test_gripper_stops_are_measured_at_startup_past_one_feedback_turn(fake_bus_with_gripper):
+    # The failure this exists for: the DM4310 reports a single-turn angle
+    # (6.283 rad) and this gripper's stroke is longer than that (i2rt measures
+    # 6.57), so its two ends alias onto nearly the same reading. Resolving the
+    # turn once at startup got it right only when the jaws happened to be shut;
+    # booting them open left the node convinced the gripper was closed for the
+    # whole session, publishing ~0.002 while the jaws were wide, and mapping
+    # every command in [0, 1] into the stop they were already resting on.
+    #
+    # dir_invert=-1 puts the travel in negative absolute radians, so the stops
+    # here are absolute [-6.57, 0] == relative [0, 6.57].
+    from openpi_control import ArmConfig, ArmSession, PositionCommand, SocketCanConnection
+
+    fake_bus_with_gripper.set_travel_limits(7, -6.57, 0.0)
+    # Enough mobility that the 0.2 Nm probe crosses the stroke inside its
+    # per-direction budget, as it does on real hardware.
+    fake_bus_with_gripper.set_torque_mobile(7, 2.0)
+    # Boot with the jaws OPEN -- the case that used to alias onto "closed".
+    fake_bus_with_gripper.set_position(7, -6.5)
+
+    session = ArmSession()
+    follower = session.add_follower(
+        ArmConfig(
+            "sil-follower",
+            "Yam",
+            SocketCanConnection(VCAN),
+            effector_model="E_Yam",
+        )
+    )
+    with session:
+        session.connect()
+        state = follower.read_state(timeout_s=20.0)
+        assert state.effector is not None
+
+        # Normalized 1.0 now means the measured open stop, not a configured
+        # 4.5 rad that the real travel runs past.
+        fake_bus_with_gripper.set_position(7, -6.57)
+        wait_for(
+            lambda: follower.read_state(timeout_s=2.0).effector.position > 0.97,
+            timeout_s=5.0,
+            what="the measured open stop to report fully open",
+        )
+        fake_bus_with_gripper.set_position(7, 0.0)
+        wait_for(
+            lambda: follower.read_state(timeout_s=2.0).effector.position < 0.03,
+            timeout_s=5.0,
+            what="the measured closed stop to report fully closed",
+        )
+
+        # Mid-travel lands where the measured stroke says it should, not where
+        # the configured 4.5 rad would have put it.
+        fake_bus_with_gripper.set_position(7, -3.285)
+        wait_for(
+            lambda: abs(follower.read_state(timeout_s=2.0).effector.position - 0.5) < 0.05,
+            timeout_s=5.0,
+            what="half the measured stroke to report 0.5",
+        )
+
+        # And a close command has to actually drive toward the closed stop --
+        # the whole symptom was a gripper that never closed.
+        follower.command(PositionCommand(state.joints.position_rad, 0.0))
+        wait_for(
+            lambda: abs(fake_bus_with_gripper.position(7)) < 0.5,
+            timeout_s=5.0,
+            what="a close command to drive the jaws to the closed stop",
+        )
+
+
+def test_gripper_calibration_keeps_configured_range_when_the_jaws_are_blocked(
+    fake_bus_with_gripper,
+):
+    # A probe that cannot reach both stops must not install what it measured:
+    # a few degrees of travel mapped onto the whole of [0, 1] would be worse
+    # than the configured range it replaced.
+    from openpi_control import ArmConfig, ArmSession, SocketCanConnection
+
+    fake_bus_with_gripper.set_stuck(7, -2.0)
+
+    session = ArmSession()
+    follower = session.add_follower(
+        ArmConfig(
+            "sil-follower",
+            "Yam",
+            SocketCanConnection(VCAN),
+            effector_model="E_Yam",
+        )
+    )
+    with session:
+        session.connect()
+        state = follower.read_state(timeout_s=20.0)
+        assert state.effector is not None
+        # Configured normalized range is [0, 4.5]; relative 2.0 of that is 0.444.
+        assert state.effector.position == pytest.approx(2.0 / 4.5, abs=0.05)
+
+
 def test_gripper_coil_overtemperature_fails_with_actionable_error(fake_bus_with_gripper):
     from openpi_control import ArmConfig, ArmSession, HardwareFaultError, SocketCanConnection
 

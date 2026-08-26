@@ -144,7 +144,7 @@ def test_yam_bimanual_declares_the_cell_s_three_cameras() -> None:
 
     assert rig.camera_names == ("top", "left_wrist", "right_wrist")
     assert {camera.name: camera.serial for camera in rig.cameras} == {
-        "top": "254623070531",
+        "top": "348523020354",  # D435; the D405 it replaced was 254623070531
         "left_wrist": "254623070863",
         "right_wrist": "254623070417",
     }

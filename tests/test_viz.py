@@ -254,8 +254,6 @@ def test_mesh_dir_falls_back_to_the_local_cache(tmp_path, monkeypatch, make_viz)
     cache.mkdir()
     trimesh = viz.import_viz_modules().trimesh
     for name in meshes.urdf_mesh_names("Yam"):
-        if "link_6" in name:
-            continue  # absent upstream, so absent here too
         trimesh.creation.box(extents=(0.05, 0.05, 0.08)).export(cache / name)
 
     monkeypatch.setattr(meshes, "cached_mesh_dir", lambda model: cache if model == "Yam" else None)
@@ -275,7 +273,7 @@ def test_an_empty_cache_leaves_the_skeleton(monkeypatch, make_viz) -> None:
 
 
 def test_missing_meshes_are_reported_not_hidden(tmp_path, monkeypatch, make_viz) -> None:
-    """i2rt ships no link_6 geometry; the gap should be stated, not silent."""
+    """A mesh dir short of a file renders that link bare; say so, don't hide it."""
     from openpi_control import meshes
 
     cache = tmp_path / "Yam"
@@ -592,9 +590,56 @@ def test_a_panel_with_no_cameras_is_allowed(preview_server) -> None:
 
 
 def test_a_preview_refuses_nonsense_settings(preview_server) -> None:
-    for kwargs in ({"max_width": 0}, {"rate_hz": 0.0}, {"rate_hz": -1.0}):
+    for kwargs in (
+        {"max_width": 0},
+        {"rate_hz": 0.0},
+        {"rate_hz": -1.0},
+        {"image_format": "webp"},
+    ):
         with pytest.raises(ConfigurationError):
             viz.CameraPanel(preview_server(), {}, **kwargs)
+
+
+def _rgb_frame(width: int = 848, height: int = 480) -> np.ndarray:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[..., 0] = 240  # red first: already RGB
+    frame[..., 1] = 120
+    frame[..., 2] = 10
+    return frame
+
+
+def test_pushed_frames_keep_their_capture_resolution(preview_server) -> None:
+    """`infer` shows what the model was handed, so nothing may be subsampled."""
+    panel = viz.CameraPanel(
+        preview_server(), {"top": _FakeReader("top")}, max_width=None, image_format="png"
+    )
+
+    panel.push({"top": _rgb_frame(848, 480)})
+
+    image = panel._tiles["top"].image
+    assert image.shape == (480, 848, 3)
+    assert tuple(image[0, 0]) == (240, 120, 10)  # rgb in, rgb out
+    assert image.flags["C_CONTIGUOUS"]
+
+
+def test_pushing_bypasses_the_readers_and_the_clock(preview_server) -> None:
+    """The tile is the observation, not a fresh picture taken beside it."""
+    reader = _FakeReader("top")
+    panel = viz.CameraPanel(preview_server(), {"top": reader}, max_width=None)
+    reader.publish(_frame())  # what the camera has now, and must not be shown
+
+    panel.push({"top": _rgb_frame(320, 240)})
+
+    assert panel._tiles["top"].image.shape == (240, 320, 3)
+    assert reader.frames_read == 1  # the panel never pulled
+
+
+def test_pushing_skips_names_with_no_tile_and_missing_frames(preview_server) -> None:
+    panel = viz.CameraPanel(preview_server(), {"top": _FakeReader("top")}, max_width=None)
+
+    panel.push({"top": None, "no_such_camera": _rgb_frame(8, 8)})
+
+    assert panel._tiles["top"].image.shape == (3, 4, 3)  # still the placeholder
 
 
 def test_a_preview_refuses_a_frame_that_is_not_a_colour_image(preview_server) -> None:
@@ -612,3 +657,292 @@ def test_removing_a_panel_drops_its_tiles(preview_server) -> None:
     panel.remove()
 
     assert panel._tiles == {}
+
+
+# --- predicted action-chunk overlay -------------------------------------------
+#
+# The overlay is built once per chunk and advanced per tick. Two failure modes
+# are guarded here, both of which happened: rebuilding it per tick cost 61 ms
+# against the 33 ms tick budget at the default 30 Hz, and hiding executed
+# segments drained the trail to nothing over each chunk.
+
+
+def _chunk(steps: int = 6, *, dof: int = 7, drift: float = 0.05) -> np.ndarray:
+    """A bimanual chunk whose flange actually moves on every step."""
+    actions = np.zeros((steps, 2 * dof))
+    for index in range(steps):
+        pose = np.array([0.0, -0.4, 0.6, 0.0, 0.3, 0.0, 1.0])[:dof] + index * drift
+        actions[index, :dof] = pose
+        actions[index, dof:] = pose
+    return actions
+
+
+def _split(actions: np.ndarray) -> dict[str, np.ndarray]:
+    return {"left": actions[:, :7], "right": actions[:, 7:]}
+
+
+def _drawn(scene) -> dict[str, int]:
+    return {
+        name: sum(1 for h in segments if h is not None and h.visible)
+        for name, segments in scene._chunk_segments.items()
+    }
+
+
+def test_a_chunk_draws_one_segment_per_predicted_step(make_scene) -> None:
+    """Plus the leading segment from the measured pose into the first action."""
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    actions = _chunk(steps=6)
+
+    scene.update_chunk(_split(actions))
+
+    for name in ("left", "right"):
+        assert len(scene._chunk_segments[name]) == 6
+        assert len(scene._chunk_points[name]) == 7  # measured pose + 6 actions
+    assert _drawn(scene) == {"left": 6, "right": 6}
+
+
+def test_the_whole_trail_stays_on_screen_for_the_life_of_the_chunk(make_scene) -> None:
+    """The regression this replaced: retiring executed segments emptied the scene.
+
+    Hiding each segment as its action ran drained 60 segments to 0 over a chunk
+    -- 1.0 s at the default 30 Hz -- and left nothing at all on screen through
+    every inference round trip, which reads as no overlay.
+    """
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    actions = _chunk(steps=8)
+    scene.update_chunk(_split(actions))
+
+    for index in range(len(actions)):
+        scene.set_chunk_progress(index + 1)
+        assert _drawn(scene) == {"left": 8, "right": 8}
+
+
+def test_advancing_the_chunk_moves_the_progress_marker_along_the_trail(make_scene) -> None:
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    actions = _chunk(steps=6)
+    scene.update_chunk(_split(actions))
+    points = scene._chunk_points["left"]
+    np.testing.assert_allclose(scene._chunk_markers["left"].position, points[0], atol=1e-6)
+
+    scene.set_chunk_progress(3)
+
+    np.testing.assert_allclose(scene._chunk_markers["left"].position, points[3], atol=1e-6)
+    np.testing.assert_allclose(
+        scene._chunk_markers["right"].position, scene._chunk_points["right"][3], atol=1e-6
+    )
+
+
+def test_the_final_tick_parks_the_marker_at_the_end_of_the_chunk(make_scene) -> None:
+    """``set_chunk_progress(len(actions))`` indexes one past the last action."""
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    actions = _chunk(steps=5)
+    scene.update_chunk(_split(actions))
+
+    scene.set_chunk_progress(len(actions))
+
+    points = scene._chunk_points["left"]
+    np.testing.assert_allclose(scene._chunk_markers["left"].position, points[-1], atol=1e-6)
+    assert _drawn(scene) == {"left": 5, "right": 5}
+
+
+def test_advancing_the_chunk_adds_and_removes_no_scene_geometry(make_scene) -> None:
+    """The per-tick path must not rebuild the overlay: that is the whole fix.
+
+    A rebuild is 60 mesh removes, 62 forward-kinematics evaluations and 60 mesh
+    adds; measured at 61 ms, against 33 ms of tick budget at the default 30 Hz.
+    """
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    actions = _chunk(steps=8)
+    scene.update_chunk(_split(actions))
+    handles = list(scene._chunk_handles)
+    added = 0
+    original = scene.server.scene.add_mesh_trimesh
+
+    def counting(*args, **kwargs):
+        nonlocal added
+        added += 1
+        return original(*args, **kwargs)
+
+    scene.server.scene.add_mesh_trimesh = counting  # type: ignore[method-assign]
+    for index in range(len(actions)):
+        scene.set_chunk_progress(index + 1)
+
+    assert added == 0
+    assert scene._chunk_handles == handles
+
+
+def test_a_chunk_the_policy_predicted_as_a_hold_collapses_to_its_approach(
+    make_scene,
+) -> None:
+    """Identical actions have no motion between them, only into the first one."""
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    held = np.tile(_chunk(steps=1)[0], (4, 1))
+
+    scene.update_chunk(_split(held))
+
+    segments = scene._chunk_segments["left"]
+    assert segments[0] is not None  # measured pose -> the held action
+    assert segments[1:] == [None, None, None]  # slots kept, nothing to draw
+    assert scene._chunk_markers["left"].visible
+
+
+def test_a_chunk_that_moves_nothing_at_all_still_shows_the_marker(make_scene) -> None:
+    """Every segment degenerate: the marker is the only thing left to draw.
+
+    Without it a policy predicting the pose the arm already holds would put
+    nothing on screen, which is indistinguishable from a broken overlay.
+    """
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    resting = np.concatenate([scene["left"].positions, [1.0]])
+    chunk = np.tile(np.concatenate([resting, resting]), (3, 1))
+
+    scene.update_chunk(_split(chunk))
+
+    assert scene._chunk_segments["left"] == [None, None, None]
+    assert scene._chunk_handles  # the markers, and nothing else
+    assert scene._chunk_markers["left"].visible
+
+
+def test_stepping_back_through_a_chunk_moves_the_marker_back(make_scene) -> None:
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    actions = _chunk(steps=5)
+    scene.update_chunk(_split(actions))
+    scene.set_chunk_progress(4)
+
+    scene.set_chunk_progress(1)
+
+    np.testing.assert_allclose(
+        scene._chunk_markers["left"].position, scene._chunk_points["left"][1], atol=1e-6
+    )
+
+
+def test_the_next_chunk_starts_over_at_its_own_beginning(make_scene) -> None:
+    """Progress belongs to the displayed chunk, not to the scene."""
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    scene.update_chunk(_split(_chunk(steps=5)))
+    scene.set_chunk_progress(4)
+
+    scene.update_chunk(_split(_chunk(steps=5, drift=0.07)))
+
+    assert scene._chunk_consumed == 0
+    np.testing.assert_allclose(
+        scene._chunk_markers["left"].position, scene._chunk_points["left"][0], atol=1e-6
+    )
+
+
+def test_advancing_with_no_chunk_on_screen_is_harmless(make_scene) -> None:
+    """ctrl-c between the clear and the next prediction must not raise."""
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    scene.update_chunk(_split(_chunk(steps=3)))
+    scene.clear_chunk()
+
+    scene.set_chunk_progress(2)
+
+    assert scene._chunk_segments == {}
+    assert scene._chunk_markers == {}
+    assert scene._chunk_consumed == 0
+
+
+def test_the_overlay_is_anchored_to_the_pose_it_was_predicted_from(make_scene) -> None:
+    """Moving the arm after the prediction must not redraw the trail.
+
+    Re-anchoring per tick is what made the old overlay stretch its first segment
+    toward wherever the arm had already travelled.
+    """
+    scene = make_scene(resolve_rig("yam_bimanual"))
+    scene.update_chunk(_split(_chunk(steps=4)))
+    before = [p.copy() for p in scene._chunk_points["left"]]
+
+    scene.update("left", np.array([0.4, -0.8, 0.9, 0.2, 0.1, 0.3]))
+    scene.set_chunk_progress(1)
+
+    for was, now in zip(before, scene._chunk_points["left"], strict=True):
+        np.testing.assert_allclose(was, now, atol=1e-9)
+
+
+def test_a_chunk_narrower_than_the_arm_is_rejected(make_scene) -> None:
+    scene = make_scene(resolve_rig("yam_bimanual"))
+
+    with pytest.raises(ConfigurationError, match="at least 6"):
+        scene.update_chunk({"left": np.zeros((4, 3)), "right": np.zeros((4, 3))})
+
+
+# --- page theme and palette ---------------------------------------------------
+
+
+def _greyscale(color) -> float:
+    """WCAG relative luminance, scaled to 0-255: what a hue-blind viewer sees."""
+
+    def channel(value: float) -> float:
+        value /= 255
+        return value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = color
+    return 255 * (0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue))
+
+
+@pytest.fixture
+def theme_calls(monkeypatch):
+    """Record configure_theme kwargs; it queues a message with no readable state."""
+    calls: list[dict] = []
+    gui_api = pytest.importorskip("viser._gui_api")
+    original = gui_api.GuiApi.configure_theme
+
+    def recording(self, **kwargs):
+        calls.append(kwargs)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(gui_api.GuiApi, "configure_theme", recording)
+    return calls
+
+
+def test_a_page_we_serve_asks_for_the_dark_canvas_its_palette_assumes(
+    make_scene, theme_calls
+) -> None:
+    """The amber axis markers sit at 2.0:1 on viser's default white canvas."""
+    make_scene(resolve_rig("yam_bimanual"))
+
+    assert len(theme_calls) == 1
+    assert theme_calls[0]["dark_mode"] is True
+
+
+def test_a_page_we_serve_does_not_offer_to_publish_the_cell(
+    make_scene, theme_calls
+) -> None:
+    """The share button relays the page; a live robot cell is not one stray click."""
+    make_scene(resolve_rig("yam_bimanual"))
+
+    assert theme_calls[0]["show_share_button"] is False
+
+
+def test_a_single_arm_page_is_themed_the_same_way(make_viz, theme_calls) -> None:
+    make_viz("Yam")
+
+    assert len(theme_calls) == 1
+    assert theme_calls[0]["dark_mode"] is True
+
+
+def test_a_server_handed_in_keeps_whatever_theme_its_owner_chose(theme_calls) -> None:
+    """A caller's page is a caller's page, chrome included."""
+    server = viz.import_viz_modules().viser.ViserServer(port=next(_PORT))
+    try:
+        viz.ArmSceneVisualizer({"only": viz.ArmSpec("Yam")}, server=server)
+        assert theme_calls == []
+    finally:
+        server.stop()
+
+
+def test_the_scene_arms_never_share_the_gui_accent_colour() -> None:
+    """A highlighted slider must not read as one of the arms."""
+    assert viz._PAGE_BRAND_COLOR not in viz._ARM_COLORS
+
+
+def test_the_first_two_arm_tints_differ_in_lightness_not_only_hue() -> None:
+    """Translucent trails overlap, and hue alone is not a distinction then.
+
+    The earlier amber sat 13/255 from the blue in greyscale -- one colour to
+    anyone not seeing hue, and to anyone reading a screenshot in greyscale.
+    """
+    left, right = viz._ARM_COLORS[0], viz._ARM_COLORS[1]
+
+    assert abs(_greyscale(left) - _greyscale(right)) > 40

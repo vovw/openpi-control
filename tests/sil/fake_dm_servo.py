@@ -188,6 +188,7 @@ class FakeDmServoBus:
         self._last_command: dict[int, tuple[float, float, float, float]] = {}
         self._last_kd: dict[int, float] = {}
         self._torque_mobile: dict[int, float] = {}
+        self._travel_limits: dict[int, tuple[float, float]] = {}
         # Torque (Nm) reported in status frames instead of the default 0.0;
         # emulates a mechanically loaded joint for safety-escalation tests.
         self._reported_torque: dict[int, float] = {}
@@ -257,6 +258,23 @@ class FakeDmServoBus:
         """
         with self._lock:
             self._torque_mobile[motor_id] = rad_per_nm_per_frame
+
+    def set_travel_limits(self, motor_id: int, low: float, high: float) -> None:
+        """Gives the motor two hard stops it cannot be driven past.
+
+        A gripper is defined by where it runs out of travel, and the startup
+        stop-probe exists to find exactly that. Without stops a torque probe
+        just accelerates forever and nothing is measurable, so a motor standing
+        in for a gripper opts into a range its position is clamped to.
+        """
+        if not low < high:
+            raise ValueError(f"travel limits must be ordered, got [{low}, {high}]")
+        with self._lock:
+            self._travel_limits[motor_id] = (low, high)
+
+    def clear_travel_limits(self, motor_id: int) -> None:
+        with self._lock:
+            self._travel_limits.pop(motor_id, None)
 
     def last_torque(self, motor_id: int) -> float:
         """Torque feedforward (Nm) carried by the most recent MIT command frame."""
@@ -598,6 +616,10 @@ class FakeDmServoBus:
                     self.positions[motor_id] = target_pos
                 elif motor_id in self._torque_mobile:
                     self.positions[motor_id] += target_tor * self._torque_mobile[motor_id]
+                limits = self._travel_limits.get(motor_id)
+                if limits is not None:
+                    low, high = limits
+                    self.positions[motor_id] = min(max(self.positions[motor_id], low), high)
         self._send_status(motor_id, error=1)
 
 

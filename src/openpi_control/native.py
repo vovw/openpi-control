@@ -82,6 +82,15 @@ MAX_STATUS_MESSAGES_PER_POLL = 256
 # state, so it is worth a warning.
 STREAM_BACKLOG_WARN_MESSAGES = 50
 
+# How long the node gets to exit after a shutdown command, before it is killed.
+# A plain SHUTDOWN de-energizes where the arm stands and exits immediately. A
+# parked shutdown is a *move*: the node acknowledges the command on receipt and
+# only then drives to home_pos, so this wait -- not the ack -- is the whole
+# budget the park gets. It matches the 60s move_to_ready() deadline, because
+# killing the node partway through the move stops the arm wherever it got to.
+SHUTDOWN_EXIT_TIMEOUT_S = 5.0
+PARKED_SHUTDOWN_EXIT_TIMEOUT_S = 60.0
+
 
 def _hardware_fault_message(log_line: str) -> str | None:
     cleaned = _ANSI_ESCAPE.sub("", log_line).strip()
@@ -1181,6 +1190,9 @@ class NativeArmBackend(ArmBackend):
             self._condition.notify_all()
         cleanup_errors: list[Exception] = []
         if self._process and self._process.poll() is None:
+            exit_timeout_s = (
+                PARKED_SHUTDOWN_EXIT_TIMEOUT_S if move_to_ready else SHUTDOWN_EXIT_TIMEOUT_S
+            )
             try:
                 command = (
                     NativeCommand.MOVE_TO_READY_AND_SHUTDOWN
@@ -1189,12 +1201,16 @@ class NativeArmBackend(ArmBackend):
                 )
                 self._send_lifecycle(command, timeout_s=60.0 if move_to_ready else 3.0)
             except Exception:
+                # The park was never accepted, so nothing is driving to
+                # home_pos: fall back to the short wait rather than holding the
+                # caller for a move that is not happening.
+                exit_timeout_s = SHUTDOWN_EXIT_TIMEOUT_S
                 try:
                     self._process.terminate()
                 except Exception as exc:  # noqa: BLE001 - finish retiring owned resources
                     cleanup_errors.append(exc)
             try:
-                self._process.wait(timeout=5)
+                self._process.wait(timeout=exit_timeout_s)
             except subprocess.TimeoutExpired:
                 try:
                     self._process.kill()

@@ -44,23 +44,43 @@ class MeshSource:
     attribution: str
     # Pinned so a fetch is reproducible and cannot change under a cached dir.
     revision: str = ""
+    # Full URLs for mesh names the vendor keeps somewhere other than base_url,
+    # or publishes under a different name. Two names may share one URL.
+    alternate_urls: dict[str, str] = field(default_factory=dict)
 
     def url_for(self, filename: str) -> str:
+        """Where the vendor publishes ``filename``, honouring any override."""
+        alternate = self.alternate_urls.get(filename)
+        if alternate is not None:
+            return alternate
         return f"{self.base_url}/{filename}"
 
+
+_I2RT_REVISION = "7b6d5016f05ca63f9ef0185b7143e63f2c7a5708"
+_I2RT_RAW = f"https://raw.githubusercontent.com/i2rt-robotics/i2rt/{_I2RT_REVISION}"
+
+# The wrist. i2rt's yam.urdf points its last link at assets/link_6_visual.stl
+# and assets/link_6_collision.stl, and the arm's own assets directory ships
+# neither: that link is the crank gripper's body, and its geometry sits under
+# the gripper model instead. Only the collision name is published there -- but
+# in this asset set every *_visual.stl is byte-for-byte its *_collision.stl
+# (base_link and links 1-5 all are), so that one file is the visual mesh too,
+# not a stand-in for a missing one. Without this the wrist rendered bare.
+_YAM_WRIST_STL = f"{_I2RT_RAW}/i2rt/robot_models/gripper/crank_4310/assets/link_6_collision.stl"
 
 # Only models whose vendor publishes meshes matching the packaged URDF's mesh
 # names appear here. The YAM URDF is i2rt's yam.urdf with its last link renamed
 # to end_link, so the 14 mesh names line up one-to-one.
 MESH_SOURCES: dict[str, MeshSource] = {
     "Yam": MeshSource(
-        base_url=(
-            "https://raw.githubusercontent.com/i2rt-robotics/i2rt/"
-            "7b6d5016f05ca63f9ef0185b7143e63f2c7a5708/i2rt/robot_models/arm/yam/assets"
-        ),
-        revision="7b6d5016f05ca63f9ef0185b7143e63f2c7a5708",
+        base_url=f"{_I2RT_RAW}/i2rt/robot_models/arm/yam/assets",
+        revision=_I2RT_REVISION,
         licence="MIT",
         attribution="I2RT Robotics — https://github.com/i2rt-robotics/i2rt",
+        alternate_urls={
+            "link_6_visual.stl": _YAM_WRIST_STL,
+            "link_6_collision.stl": _YAM_WRIST_STL,
+        },
     ),
 }
 
@@ -73,9 +93,10 @@ class FetchReport:
     directory: Path
     fetched: list[str] = field(default_factory=list)
     already_present: list[str] = field(default_factory=list)
-    # Referenced by the URDF but absent upstream. i2rt's own yam.urdf points at
-    # link_6_visual/collision.stl, which its repository does not ship, so the
-    # wrist link renders without geometry. Not an error.
+    # Referenced by the URDF but not published anywhere this source knows to
+    # look. Those links render without geometry; the rest still draw. Not an
+    # error -- but worth checking against the vendor's layout before accepting,
+    # since a mesh can simply have moved (see _YAM_WRIST_STL).
     unavailable: list[str] = field(default_factory=list)
 
     @property
@@ -155,63 +176,87 @@ def fetch_meshes(
     directory.mkdir(parents=True, exist_ok=True)
     report = FetchReport(model=model, directory=directory)
 
-    # Names a previous fetch proved absent upstream. Remembering them keeps a
-    # repeat fetch from needing the network just to collect the same 404s.
-    known_absent = _read_absent(directory) if not force else set()
+    # Names a previous fetch proved absent upstream, each against the URL it
+    # tried. Remembering them keeps a repeat fetch from needing the network just
+    # to collect the same 404s; recording the URL means a name we have since
+    # learned to look for elsewhere is retried rather than written off.
+    known_absent = _read_absent(directory) if not force else {}
 
+    # Two URDF names can name one upstream file, so fetch per URL, not per name.
+    by_url: dict[str, list[str]] = {}
     for name in names:
-        target = directory / name
-        if target.exists() and not force:
-            report.already_present.append(name)
+        by_url.setdefault(source.url_for(name), []).append(name)
+
+    for url, sharing in by_url.items():
+        wanted = []
+        for name in sharing:
+            if (directory / name).exists() and not force:
+                report.already_present.append(name)
+            elif known_absent.get(name) == url:
+                report.unavailable.append(name)
+            else:
+                wanted.append(name)
+        if not wanted:
             continue
-        if name in known_absent:
-            report.unavailable.append(name)
-            continue
+        listed = ", ".join(wanted)
         try:
             with urllib.request.urlopen(  # noqa: S310 - fixed https vendor URL
-                source.url_for(name), timeout=_FETCH_TIMEOUT_S
+                url, timeout=_FETCH_TIMEOUT_S
             ) as response:
                 payload = response.read()
         except urllib.error.HTTPError as err:
             if err.code == 404:
-                report.unavailable.append(name)
+                report.unavailable.extend(wanted)
                 continue
             raise ConfigurationError(
-                f"fetching {name} for {model} failed: HTTP {err.code} {err.reason}"
+                f"fetching {listed} for {model} failed: HTTP {err.code} {err.reason}"
             ) from err
         except OSError as err:
             raise ConfigurationError(
-                f"fetching {name} for {model} failed: {err}. "
+                f"fetching {listed} for {model} failed: {err}. "
                 "The first run needs network access; later runs use the cache."
             ) from err
-        # Write via a temporary name so an interrupted fetch cannot leave a
-        # truncated STL that later runs would treat as cached.
-        partial = target.with_suffix(target.suffix + ".partial")
-        partial.write_bytes(payload)
-        partial.replace(target)
-        report.fetched.append(name)
+        for name in wanted:
+            # Write via a temporary name so an interrupted fetch cannot leave a
+            # truncated STL that later runs would treat as cached.
+            target = directory / name
+            partial = target.with_suffix(target.suffix + ".partial")
+            partial.write_bytes(payload)
+            partial.replace(target)
+            report.fetched.append(name)
 
     _write_attribution(directory, model, source)
-    _write_absent(directory, report.unavailable)
+    _write_absent(directory, {name: source.url_for(name) for name in report.unavailable})
     return report
 
 
 _ABSENT_FILE = "unavailable-upstream.txt"
 
 
-def _read_absent(directory: Path) -> set[str]:
+def _read_absent(directory: Path) -> dict[str, str]:
+    """Mesh names a previous fetch missed, each with the URL it asked for.
+
+    A line without a URL was written before this file recorded one, so it says
+    nothing about where we would look now: dropping it costs one repeat 404 and
+    buys a cache that heals itself when a mesh source learns a better address.
+    """
     marker = directory / _ABSENT_FILE
     if not marker.is_file():
-        return set()
-    return {line.strip() for line in marker.read_text().splitlines() if line.strip()}
+        return {}
+    absent = {}
+    for line in marker.read_text().splitlines():
+        name, _, url = line.strip().partition("\t")
+        if name and url:
+            absent[name] = url
+    return absent
 
 
-def _write_absent(directory: Path, names: list[str]) -> None:
+def _write_absent(directory: Path, absent: dict[str, str]) -> None:
     marker = directory / _ABSENT_FILE
-    if not names:
+    if not absent:
         marker.unlink(missing_ok=True)
         return
-    marker.write_text("\n".join(sorted(names)) + "\n")
+    marker.write_text("".join(f"{name}\t{absent[name]}\n" for name in sorted(absent)))
 
 
 def _write_attribution(directory: Path, model: str, source: MeshSource) -> None:

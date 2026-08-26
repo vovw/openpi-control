@@ -366,15 +366,23 @@ def record_session(
     max_stall_s: float = DEFAULT_MAX_STALL_S,
     camera_warmup_s: float = DEFAULT_CAMERA_WARMUP_S,
     report: object | None = None,
+    finalize: bool = True,
+    save_on_interrupt: bool = False,
 ) -> RecordResult:
     """Drive the arms from ``source`` and write episodes to ``sink``.
 
     Teleop keeps driving between episodes on purpose: resetting the scene with
     the arm is most of what happens between takes, and an operator should not
     have to think about whether the arm is live. Only frames between a START and
-    its SAVE are written.
+    its SAVE are written, except that ``save_on_interrupt`` also keeps the
+    already-captured prefix.
 
     ``num_episodes`` of 0 runs until the source says STOP or ``stop`` is set.
+
+    By default, Ctrl-C discards an open episode because that is the safe
+    default for teleoperation. ``save_on_interrupt`` keeps all frames already
+    captured in a partial episode instead; the policy rollout recorder uses
+    that mode so an operator can stop a trial without losing its data.
 
     The source does not have to track whether an episode is open: START while
     recording discards and restarts, SAVE while idle does nothing. That keeps a
@@ -412,6 +420,7 @@ def record_session(
     stalled_ticks = 0
     consecutive_stalls = 0
     ended_by = "stop requested"
+    interrupted = False
     # Last good frame per camera: LeRobot needs every feature on every frame, so
     # a camera that misses a grab repeats rather than dropping out of the schema.
     last_frames: dict[str, np.ndarray] = {}
@@ -508,12 +517,23 @@ def record_session(
             next_tick = _wait(next_tick, period)
     except KeyboardInterrupt:
         ended_by = "interrupted"
+        interrupted = True
     finally:
         if recording:
-            # An interrupted take is not a take. Saving a partial episode would
-            # put a demonstration that stops mid-motion into the dataset.
-            drop("session ended mid-episode")
-        sink.finalize()
+            if save_on_interrupt and interrupted and frames_in_episode:
+                sink.save_episode()
+                recording = False
+                total_frames += frames_in_episode
+                say(
+                    f"episode {sink.num_episodes - 1} saved partially "
+                    f"({frames_in_episode} frames; interrupted)"
+                )
+            else:
+                # An interrupted take is discarded by default. Rollout
+                # recording opts into saving partial data above.
+                drop("session ended mid-episode")
+        if finalize:
+            sink.finalize()
 
     return RecordResult(
         episodes=sink.num_episodes,
@@ -850,4 +870,3 @@ def _require_lerobot():  # noqa: ANN202 - the lerobot dataset module, Any by des
             "nothing and this is the error you get."
         ) from err
     return lerobot_dataset
-

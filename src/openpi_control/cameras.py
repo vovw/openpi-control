@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .camera_poses import CameraExtrinsic
 from .exceptions import ConfigurationError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -47,7 +48,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 # Where udev publishes its stable per-device symlinks. Overridable in tests and
 # on the odd system that mounts devtmpfs somewhere else.
-BY_ID_DIR = Path("/dev/v4l/by-id")
+#
+# Redirecting this (or passing ``by_id_dir``) means "this directory is the whole
+# bus", and discovery honours that literally: the SDK fallback for cameras udev
+# cannot name is only consulted when the real system directory is in play.
+# Otherwise whatever happens to be plugged into the machine running the tests
+# would leak into their results.
+SYSTEM_BY_ID_DIR = Path("/dev/v4l/by-id")
+BY_ID_DIR = SYSTEM_BY_ID_DIR
 
 # A D405 publishes six v4l2 nodes; index 4 is the colour stream. Other
 # RealSense models enumerate differently, so a camera that needs another node
@@ -57,7 +65,13 @@ DEFAULT_COLOR_INDEX = 4
 # by-id entries look like:
 #   usb-Intel_R__RealSense_TM__Depth_Camera_405_..._254623070531-video-index4
 # Capture the serial (the digits before ``-video-index``) and the node number.
-_BY_ID_RE = re.compile(r"RealSense.*?_(\d+)-video-index(\d+)$")
+#
+# At least six digits, because a camera whose USB descriptor carries no serial
+# at all gets a by-id name that ends in its model number instead --
+# ``..._Depth_Camera_435_..._Depth_Camera_435-video-index0`` -- and a lazy
+# pattern happily reads that ``435`` as the serial. That invents a camera which
+# is not there and hides the one that is (see `sdk_present_asic_serials`).
+_BY_ID_RE = re.compile(r"RealSense.*?_(\d{6,})-video-index(\d+)$")
 
 # Capture defaults. 848x480 is the D405's native colour mode, and that is why
 # it is the default rather than the rounder-looking 640x480: asking for 640x480
@@ -107,6 +121,9 @@ class RigCamera:
     recorder, policy -- sees the same corrected frame. A wrist camera mounted
     sideways is a mechanical fact; fixing it once here beats fixing it in three
     places later.
+
+    ``extrinsic`` is optional calibration metadata for scene visualization. It
+    does not alter the policy image or camera discovery.
     """
 
     name: str
@@ -119,6 +136,7 @@ class RigCamera:
     fps: int = DEFAULT_FPS
     pixel_format: str = DEFAULT_PIXEL_FORMAT
     color_index: int = DEFAULT_COLOR_INDEX
+    extrinsic: CameraExtrinsic | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -254,6 +272,38 @@ def present_serials(by_id_dir: Path | None = None) -> dict[tuple[str, int], str]
     return found
 
 
+def sdk_present_asic_serials() -> dict[str, str]:
+    """``{asic_serial: sdk_serial}`` for every RealSense the SDK can see.
+
+    The second source of truth for "is this camera plugged in". udev is the
+    first and the cheaper one, but it can only answer for a camera whose USB
+    descriptor carries a serial, and not every RealSense does: this cell's D435
+    publishes its nodes as ``..._Depth_Camera_435-video-index0`` with no serial
+    anywhere in the name, and its colour node gets no by-id entry at all. The
+    SDK still addresses it perfectly well, which is the only thing that has to
+    work -- device paths here are diagnostics, never how a stream is opened.
+
+    Returns ``{}`` when the SDK is not installed, so discovery keeps working on
+    a machine that only has udev.
+    """
+    try:
+        rs = _require_realsense()
+    except ConfigurationError:
+        return {}
+    found: dict[str, str] = {}
+    try:
+        devices = rs.context().query_devices()
+    except Exception:  # noqa: BLE001 - a wedged SDK must not fail discovery
+        return {}
+    for device in devices:
+        asic = rs.camera_info.asic_serial_number
+        serial = rs.camera_info.serial_number
+        if not device.supports(asic) or not device.supports(serial):
+            continue
+        found[str(device.get_info(asic))] = str(device.get_info(serial))
+    return found
+
+
 def discover(
     cameras: Iterable[RigCamera],
     *,
@@ -277,6 +327,10 @@ def discover(
         )
 
     nodes = present_serials(by_id_dir)
+    # Only consulted for cameras udev could not name, so the common path stays
+    # a directory listing and no rig pays for an SDK query it does not need.
+    root = BY_ID_DIR if by_id_dir is None else by_id_dir
+    sdk_serials: dict[str, str] | None = None if root == SYSTEM_BY_ID_DIR else {}
     matched: dict[str, FoundCamera] = {}
     missing: dict[str, str] = {}
     for camera in cameras:
@@ -289,12 +343,22 @@ def discover(
             continue
         device = nodes.get((camera.serial, camera.color_index))
         if device is None:
-            missing[camera.name] = camera.serial
+            if sdk_serials is None:
+                sdk_serials = sdk_present_asic_serials()
+            sdk_serial = sdk_serials.get(camera.serial)
+            if sdk_serial is None:
+                missing[camera.name] = camera.serial
+            else:
+                matched[camera.name] = FoundCamera(camera, f"sdk:{sdk_serial}")
         else:
             matched[camera.name] = FoundCamera(camera, device)
 
     claimed = {camera.serial for camera in cameras}
-    unclaimed = tuple(sorted({serial for serial, _ in nodes} - claimed))
+    present = {serial for serial, _ in nodes}
+    if sdk_serials is None and not claimed.issubset(present):
+        sdk_serials = sdk_present_asic_serials()
+    present |= set(sdk_serials or {})
+    unclaimed = tuple(sorted(present - claimed))
     return DiscoveryResult(matched=matched, missing=missing, unclaimed=unclaimed)
 
 

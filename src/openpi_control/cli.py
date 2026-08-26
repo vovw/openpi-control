@@ -1,6 +1,6 @@
-"""Operator CLI: preflight an arm, and zero its servos.
+"""Operator CLI: preflight, maintain, drive, and infer on connected arms.
 
-Two commands, both aimed at the jobs you do before an arm is usable:
+Commands aimed at the jobs around making an arm usable:
 
 ``doctor``
     Read-only checks: do the packaged assets resolve, is every servo model
@@ -26,6 +26,15 @@ Two commands, both aimed at the jobs you do before an arm is usable:
     grabs a frame, and ``--snapshot`` writes those frames out so you can check
     where a wrist camera is pointing without a headset.
 
+``infer``
+    Run the bimanual YAM MolmoAct2 HTTP client, execute bounded action chunks,
+    and show measured poses plus predicted end-effector trails in Viser.
+
+``rollout``
+    Run timed, interactive MolmoAct2 episodes, save every completed or
+    Ctrl-C-interrupted episode as LeRobot v3, and collect a terminal
+    success/failure label for each attempt.
+
 All of them attach :func:`openpi_control.runlog.setup_run_logging`, so every run
 leaves a trace under ``~/openpi-data/logs/runtime/``.
 """
@@ -44,6 +53,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from . import cameras as cameras_mod
 from . import meshes, runlog
 from .config import (
@@ -53,7 +64,32 @@ from .config import (
     connection_for_interface,
     resolve_model_assets,
 )
-from .exceptions import ConfigurationError
+from .exceptions import ConfigurationError, PiControlError
+from .inference import (
+    DEFAULT_CHUNK_SPEED,
+    DEFAULT_MAX_EFFECTOR_STEP,
+    DEFAULT_MAX_STEP_RAD,
+    DEFAULT_MOLMOACT_JPEG_QUALITY,
+    DEFAULT_MOLMOACT_NUM_STEPS,
+    DEFAULT_PREFETCH_MARGIN_S,
+    DEFAULT_REQUEST_TIMEOUT_S,
+    MOLMOACT_ACTION_HORIZON,
+    SUB_STEP_PERIOD_S,
+    BoundedChunkExecutor,
+    ChunkPrefetcher,
+    EncodedFramesUnsupported,
+    GripperWatch,
+    InferenceError,
+    MolmoActClient,
+    ReachingChunkExecutor,
+    build_observation,
+    command_lag,
+    served_frames,
+    split_chunk,
+    start_pose_plan,
+    time_scale,
+)
+from .inference_record import InferenceRolloutSource
 from .rigs import Rig, RigArm, resolve_rig, rig_names
 from .servos import SERVO_ZERO_DRIVERS, buses
 
@@ -63,6 +99,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .arms import FollowerArm, LeaderArm
     from .backend import ArmBackend
     from .session import ArmSession
+    from .types import PositionCommand
 
 _OK = "ok"
 _WARN = "warn"
@@ -610,6 +647,14 @@ def _confirm(plan: tuple[ServoEntry, ...], model: str, interface: str) -> bool:
     print()
     print("The arm's CURRENT physical pose becomes zero for every servo listed.")
     print("Move it to the intended zero pose and support it before continuing.")
+    for entry in writable:
+        if entry.source == "arm":
+            continue
+        print()
+        print(f"  {entry.label()} is the GRIPPER, and its zero is not a pose you pick:")
+        print("  the stops are measured at every startup (E_Yam needs_calibration), so")
+        print("  this write only shifts the frame that calibration then anchors. Zero it")
+        print("  with the jaws shut if you zero it at all.")
     reply = input("Type 'zero' to proceed: ").strip()
     return reply == "zero"
 
@@ -707,27 +752,40 @@ def power_down(session: ArmSession, live_arms: list[LiveArm], *, park: bool = Tr
     that move -- it is never dropped from wherever it happened to be standing.
     A node that does not advertise CAP_MOVE_TO_READY is closed in place, said
     out loud rather than silently.
+
+    The park is a real move and takes seconds; each one reports how long it
+    took, so an arm on its way to home_pos never reads as a hung shutdown. A
+    ctrl-c during it is honored -- it just cannot be allowed to skip the
+    de-energize below, which is the only thing that retires the nodes.
     """
     failures = 0
     if park:
-        for entry in live_arms:
-            try:
-                supported = entry.arm.capabilities.supports_move_to_ready
-            except Exception as err:  # noqa: BLE001 - keep putting the rest down
-                failures += 1
-                print(f"  {entry.name}: cannot check the ready move: {err}")
-                continue
-            if not supported:
-                print(f"  {entry.name}: node has no ready move; closing in place")
-                continue
-            print(f"  parking {entry.name} -> home_pos ...", end="", flush=True)
-            try:
-                entry.arm.close(move_to_ready=True)
-            except Exception as err:  # noqa: BLE001 - keep putting the rest down
-                failures += 1
-                print(f" FAILED: {type(err).__name__}: {err}")
-            else:
-                print(" done")
+        try:
+            for entry in live_arms:
+                try:
+                    supported = entry.arm.capabilities.supports_move_to_ready
+                except Exception as err:  # noqa: BLE001 - keep putting the rest down
+                    failures += 1
+                    print(f"  {entry.name}: cannot check the ready move: {err}")
+                    continue
+                if not supported:
+                    print(f"  {entry.name}: node has no ready move; closing in place")
+                    continue
+                print(f"  parking {entry.name} -> home_pos ...", end="", flush=True)
+                started = time.monotonic()
+                try:
+                    entry.arm.close(move_to_ready=True)
+                except Exception as err:  # noqa: BLE001 - keep putting the rest down
+                    failures += 1
+                    print(f" FAILED: {type(err).__name__}: {err}")
+                else:
+                    print(f" done ({time.monotonic() - started:.1f}s)")
+        except KeyboardInterrupt:
+            # A second ctrl-c aborts the remaining parks, but the arms that are
+            # still energized are this process's to put down: fall through to
+            # session.close() instead of letting the interrupt unwind past it.
+            failures += 1
+            print("\n  park interrupted; de-energizing where the arms stand")
 
     # Always reached, parked or not: session.close() is what retires the nodes
     # and the sockets, and it is idempotent for an arm already closed above.
@@ -914,6 +972,691 @@ def run_live(
             scene.server.stop()
         failures = power_down(session, live_arms, park=park)
     return 1 if failures else 0
+
+
+# --------------------------------------------------------------------------- #
+# MolmoAct2 inference
+# --------------------------------------------------------------------------- #
+
+
+def open_inference_cameras(
+    rig: Rig,
+    *,
+    overrides: dict[str, str] | None = None,
+    warmup_s: float = _CAMERA_WARMUP_S,
+) -> dict[str, cameras_mod.CameraReader]:
+    """Open all three trained MolmoAct2 views, or none of them."""
+    expected = {"top", "left_wrist", "right_wrist"}
+    actual = set(rig.camera_names)
+    if actual != expected:
+        raise ConfigurationError(
+            "MolmoAct2 bimanual inference needs cameras top, left_wrist, and right_wrist; "
+            f"rig {rig.name!r} declares {', '.join(rig.camera_names) or 'none'}"
+        )
+    discovery = cameras_mod.discover(rig.cameras, overrides=overrides)
+    if discovery.missing:
+        details = ", ".join(
+            f"{name} (serial {serial})" for name, serial in discovery.missing.items()
+        )
+        raise ConfigurationError(f"inference cameras missing: {details}")
+    specs = tuple(found.spec() for found in discovery.matched.values())
+    readers = cameras_mod.open_readers(specs)
+    try:
+        for name, reader in readers.items():
+            if reader.wait_for_frame(warmup_s) is None:
+                raise ConfigurationError(
+                    f"inference camera {name!r} opened but delivered no frame in {warmup_s:g}s"
+                )
+    except BaseException:
+        cameras_mod.close_readers(readers)
+        raise
+    return readers
+
+
+def _inference_states(live_arms: list[LiveArm], *, max_age_s: float) -> dict[str, object]:
+    """Return the latest states after the observation builder has checked them."""
+    states: dict[str, object] = {}
+    for entry in live_arms:
+        state = entry.arm.latest_state
+        if state is None or not state.is_fresh(max_age_s):
+            age = "missing" if state is None else f"{state.age_s * 1e3:.0f} ms old"
+            raise InferenceError(f"{entry.name} state is not fresh ({age})")
+        states[entry.name] = state
+    return states
+
+
+def run_infer(
+    rig: Rig,
+    *,
+    instruction: str,
+    server: str | None = None,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+    num_steps: int = DEFAULT_MOLMOACT_NUM_STEPS,
+    enable_cuda_graph: bool = True,
+    jpeg_quality: int = DEFAULT_MOLMOACT_JPEG_QUALITY,
+    control_rate_hz: float = _MIRROR_RATE_HZ,
+    speed: float = DEFAULT_CHUNK_SPEED,
+    max_step_rad: float = DEFAULT_MAX_STEP_RAD,
+    max_effector_step: float = DEFAULT_MAX_EFFECTOR_STEP,
+    carry_targets: bool = False,
+    reach_actions: bool = False,
+    prefetch: bool = True,
+    prefetch_margin_s: float = DEFAULT_PREFETCH_MARGIN_S,
+    reset_start_pose: bool = False,
+    park: bool = True,
+    visualize: bool = True,
+    camera_overrides: dict[str, str] | None = None,
+    port: int = 8080,
+    mesh_dir: Path | None = None,
+    backend_factory: Callable[[RigArm], ArmBackend] | None = None,
+    stop: threading.Event | None = None,
+    policy: MolmoActClient | None = None,
+) -> int:
+    """Run MolmoAct2 closed-loop inference against the bimanual YAM rig.
+
+    The wire defaults are the reference deployment's. ``reach_actions`` and
+    ``reset_start_pose`` are off by default because switching every execution
+    flag on at once behaved worse on this rig; see ``docs/inference.md``.
+
+    ``prefetch`` is on, and is the exception because it does not change what the
+    policy is asked to do or how a chunk is executed -- only *when* the next
+    call is made. Inferring between chunks leaves the arms holding still for a
+    whole round trip at every chunk boundary (0.25 s against a 1.0 s chunk on
+    this rig: a quarter of the run standing still, and a visible hitch in the
+    motion every second). Prefetching hides the call under the motion already
+    queued. The cost is that the observation is one round trip old, which is
+    what ``prefetch_margin_s`` trades against running the queue dry.
+
+    ``speed`` and ``carry_targets`` are the two knobs for a run that is too
+    reactive rather than too slow. ``speed`` below 1.0 plays each chunk over
+    proportionally more ticks -- the same path, walked gently, and re-planned
+    less often because the chunk lasts longer. ``carry_targets`` stops the
+    joint targets being pulled back to the measured pose at each chunk
+    boundary. Neither changes what the policy is asked for; both change how
+    hard the answer is driven, so A/B them one at a time.
+    """
+    if tuple(rig.names) != ("left", "right"):
+        raise ConfigurationError(
+            "MolmoAct2 bimanual inference requires the packaged left/right YAM rig"
+        )
+    if not instruction.strip():
+        raise ConfigurationError("inference instruction must not be empty")
+    if control_rate_hz <= 0:
+        raise ConfigurationError("--control-rate must be positive")
+    if speed <= 0:
+        raise ConfigurationError("--speed must be positive")
+    if prefetch_margin_s < 0:
+        raise ConfigurationError("--prefetch-margin-s must not be negative")
+    stop = stop if stop is not None else threading.Event()
+    # num_steps and the CUDA-graph request live on the client rather than on
+    # each call, so a prefetched chunk is asked for exactly the same way as a
+    # synchronous one.
+    client = policy or MolmoActClient(
+        server,
+        timeout_s=request_timeout_s,
+        num_steps=num_steps,
+        jpeg_quality=jpeg_quality,
+        enable_cuda_graph=enable_cuda_graph,
+    )
+    client.health()
+
+    # RGB is part of the model contract. The existing live command keeps BGR
+    # for its cheap browser preview; inference requests RGB from the SDK so it
+    # does not pay a channel swap on every HTTP request.
+    capture_rig = rig.with_camera_capture(pixel_format="rgb8")
+    scene = None
+    camera_readers: dict[str, cameras_mod.CameraReader] = {}
+    session = None
+    live_arms: list[LiveArm] = []
+    prefetcher: ChunkPrefetcher | None = None
+    failures = 0
+    runtime_error: Exception | None = None
+    try:
+        if visualize:
+            from .viz import ArmSceneVisualizer
+
+            scene = ArmSceneVisualizer.from_rig(rig, mesh_dir=mesh_dir, port=port)
+        camera_readers = open_inference_cameras(capture_rig, overrides=camera_overrides)
+        session, live_arms = power_up(
+            rig, float_mode=False, backend_factory=backend_factory
+        )
+        arm_map = {entry.name: entry.arm for entry in live_arms}
+        limits = {
+            name: (
+                np.array([spec.lower for spec in scene[name].joint_specs], dtype=np.float64)
+                if scene is not None
+                else np.full(6, -np.inf),
+                np.array([spec.upper for spec in scene[name].joint_specs], dtype=np.float64)
+                if scene is not None
+                else np.full(6, np.inf),
+            )
+            for name in ("left", "right")
+        }
+        executor: BoundedChunkExecutor | ReachingChunkExecutor = (
+            ReachingChunkExecutor(
+                max_joint_step_rad=max_step_rad,
+                max_effector_step=max_effector_step,
+            )
+            if reach_actions
+            else BoundedChunkExecutor(
+                max_step_rad=max_step_rad,
+                max_effector_step=max_effector_step,
+                carry_targets=carry_targets,
+            )
+        )
+        if prefetch:
+            prefetcher = ChunkPrefetcher(client)
+        gripper = GripperWatch()
+        stalled_grippers: set[str] = set()
+        clamped_before = 0
+        last_chunk_len = MOLMOACT_ACTION_HORIZON
+        last_lag = 0.0
+        camera_panel = None
+        gripper_panel = None
+        if scene is not None:
+            from .viz import CameraPanel, GripperPanel
+
+            # The render has no gripper joint to move (the YAM URDF's six
+            # joints stop at the wrist), so the page states the gripper in
+            # numbers instead of implying it with a mesh that never changes.
+            gripper_panel = GripperPanel(scene.server, ("left", "right"))
+
+            # The tiles are the policy's own input, decoded back off the wire
+            # and pushed once per inference -- not a preview taken beside it --
+            # so they are served at capture resolution and never on a clock.
+            camera_panel = CameraPanel(
+                scene.server, camera_readers, folder="Policy input", max_width=None
+            )
+            print(f"  viser    {scene.url}")
+        print(f"  inference {client.url} — {instruction}")
+        # Said before anything moves, because the operator can see the jaws and
+        # the number in the same glance. The Viser render cannot help here: the
+        # packaged YAM URDF has six actuated joints and the gripper is baked
+        # into link_6's mesh, so the render shows the same jaws whatever the
+        # gripper is doing. A reading that disagrees with the hardware in front
+        # of you means the gripper servo is zeroed at the wrong stop.
+        opening = _inference_states(live_arms, max_age_s=0.25)
+        readings = ", ".join(
+            f"{name} {state.effector.position:.3f}"  # type: ignore[union-attr]
+            for name, state in sorted(opening.items())
+            if state.effector is not None  # type: ignore[union-attr]
+        )
+        print(f"  gripper  measured now: {readings} (1.0 = open) — check the jaws agree")
+        runtime = [
+            label
+            for label, enabled in (
+                (f"speed {speed:g}x", speed != 1.0),
+                ("carry-targets", carry_targets),
+                ("reach-actions", reach_actions),
+                ("no-prefetch", not prefetch),
+                ("reset-start-pose", reset_start_pose),
+                ("raw-frames", jpeg_quality <= 0),
+                ("no-cuda-graph", not enable_cuda_graph),
+            )
+            if enabled
+        ]
+        if runtime:
+            print(f"  runtime  {', '.join(runtime)}")
+        print("ctrl-c to park at home_pos and power down")
+
+        period = 1.0 / control_rate_hz
+
+        def walk(rows: list[dict[str, PositionCommand]]) -> None:
+            """Command an interpolated ramp, one row per ``SUB_STEP_PERIOD_S``."""
+            for row in rows:
+                if stop.is_set():
+                    return
+                for name, command in row.items():
+                    arm_map[name].command(command)
+                stop.wait(SUB_STEP_PERIOD_S)
+
+        def request(observation: object) -> np.ndarray:
+            if prefetcher is not None:
+                return prefetcher.take(observation, instruction)  # type: ignore[arg-type]
+            return client.infer(observation, instruction)  # type: ignore[arg-type]
+
+        def infer_chunk(observation: object) -> np.ndarray:
+            """One chunk, dropping to raw frames if the server cannot decode JPEG.
+
+            Said once and loudly, then the run continues: losing two energized
+            arms mid-task to a payload format is a poor trade for a server that
+            predates the encoded-frame branch in its ``_to_pil``.
+            """
+            try:
+                return request(observation)
+            except EncodedFramesUnsupported as err:
+                if int(getattr(client, "jpeg_quality", 0)) <= 0:
+                    raise
+                print(f"  frames   {err}", file=sys.stderr)
+                print(
+                    "  frames   sending raw frames for the rest of the run", file=sys.stderr
+                )
+                client.jpeg_quality = 0
+                if prefetcher is not None:
+                    prefetcher.drop()
+                return request(observation)
+
+        if reset_start_pose:
+            states = _inference_states(live_arms, max_age_s=0.25)
+            plan = start_pose_plan(states)  # type: ignore[arg-type]
+            print(f"  reset    ramping to the training start pose ({len(plan)} steps)")
+            walk(plan)
+
+        while not stop.is_set():
+            observation = build_observation(arm_map, camera_readers)
+            states = _inference_states(live_arms, max_age_s=0.25)
+            if scene is not None:
+                for name, state in states.items():
+                    scene.update(name, state.joints.position_rad)  # type: ignore[union-attr]
+            if isinstance(executor, BoundedChunkExecutor):
+                executor.reset(states)  # type: ignore[arg-type]
+            actions = infer_chunk(observation)
+            # The overlay draws the policy's own plan, so it is built from the
+            # chunk rather than from the resampled ticks; the marker below is
+            # scaled back into action space to follow it.
+            plan = time_scale(actions, speed)
+            if scene is not None:
+                scene.update_chunk(split_chunk(actions))
+            if camera_panel is not None:
+                camera_panel.push(served_frames(client))
+            latency = getattr(client, "last_latency", None) or {}
+            reading = gripper.render()
+            clamped_now = executor.clamped
+            print(
+                f"  chunk    {len(actions)} actions"
+                + (f" over {len(plan)} ticks" if len(plan) != len(actions) else "")
+                + "  "
+                f"{latency.get('round_trip_s', 0.0):.2f}s "
+                f"(gpu {latency.get('gpu_s', 0.0):.2f} "
+                f"+ wire {latency.get('transport_s', 0.0):.2f})  "
+                f"{latency.get('payload_mb', 0.0):.2f} MB  "
+                # Per chunk first, running total second. The total on its own
+                # only ever says how long the run has been going: it is the
+                # rate that says whether the policy is being slowed down, and
+                # making the reader subtract two log lines to find it meant
+                # nobody did. Both counts describe the chunk just executed --
+                # this line is printed before the new one runs, same as `grip`.
+                f"clamped +{executor.clamped - clamped_before}/{last_chunk_len} "
+                f"({executor.clamped})  "
+                # The other half of the same question. `clamped` says how much
+                # of the plan the limit refused; `lag` says how much of what
+                # was *not* refused the arms failed to reach. A low clamp count
+                # beside a large lag is hardware that cannot keep up with the
+                # plan, and no clamp setting fixes that -- `--speed` does.
+                f"lag {last_lag:.3f}"
+                + (f"  grip {reading}" if reading else ""),
+                flush=True,
+            )
+            clamped_before = clamped_now
+            # Ticks, not actions: the clamp is counted once per command issued,
+            # so the denominator has to be what the chunk was executed as.
+            last_chunk_len = len(plan)
+            lag = 0.0
+            # Said once per arm and then not repeated: a gripper that is inert
+            # stays inert, and a warning on every chunk would bury the run.
+            for name in gripper.stalled():
+                if name in stalled_grippers:
+                    continue
+                stalled_grippers.add(name)
+                print(
+                    f"  gripper  {name} is NOT TRACKING: commanded across "
+                    f"{gripper.command_travel:.2f} of its range and the measured "
+                    f"position has not moved once. Check the startup calibration "
+                    f"line in the node log — a stroke it could not measure means "
+                    f"the jaws were blocked when it probed, and the run is using "
+                    f"the configured range instead.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if gripper_panel is not None:
+                gripper_panel.update(
+                    gripper.commanded, gripper.measured, stalled=sorted(stalled_grippers)
+                )
+
+            for index, action in enumerate(plan):
+                if stop.is_set():
+                    break
+                tick_start = time.monotonic()
+                states = _inference_states(live_arms, max_age_s=0.25)
+                if isinstance(executor, ReachingChunkExecutor):
+                    # The reference runtime: walk to the action so the arm
+                    # arrives at it, which paces itself and usually outruns the
+                    # nominal tick below.
+                    rows = executor.plan(action, states, limits=limits)  # type: ignore[arg-type]
+                    walk(rows)
+                    issued = rows[-1] if rows else None
+                else:
+                    issued = executor.step(action, limits=limits)
+                    for name, command in issued.items():
+                        arm_map[name].command(command)
+                if issued is not None:
+                    gripper.observe(issued, states)  # type: ignore[arg-type]
+                    # Against the state read at the top of this tick, so it is
+                    # the gap the arms were still carrying when this command
+                    # went out: how far behind the plan the hardware is running.
+                    lag = max(lag, command_lag(issued, states))  # type: ignore[arg-type]
+                if scene is not None:
+                    for name, state in states.items():
+                        scene.update(name, state.joints.position_rad)  # type: ignore[union-attr]
+                    # Advance the overlay, do not rebuild it: this runs every
+                    # control tick, and a rebuild costs 61 ms against a 33 ms
+                    # period at the default 30 Hz.
+                    scene.set_chunk_progress(int(round((index + 1) * speed)))
+                if prefetcher is not None and not prefetcher.busy:
+                    # Fire once the motion still queued is shorter than the call
+                    # takes, so the next chunk lands just as this one runs out.
+                    queued_s = (len(plan) - index - 1) * period
+                    if queued_s <= prefetcher.latency_s + prefetch_margin_s:
+                        prefetcher.submit(
+                            build_observation(arm_map, camera_readers), instruction
+                        )
+                remaining = period - (time.monotonic() - tick_start)
+                if remaining > 0:
+                    stop.wait(remaining)
+            last_lag = lag
+    except KeyboardInterrupt:
+        print()
+    except (InferenceError, ConfigurationError, PiControlError) as err:
+        runtime_error = err
+        print(f"inference stopped: {type(err).__name__}: {err}", file=sys.stderr)
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
+        client.close()
+        if scene is not None:
+            scene.clear_chunk()
+        cameras_mod.close_readers(camera_readers)
+        if scene is not None:
+            scene.server.stop()
+        if session is not None:
+            failures = power_down(session, live_arms, park=park)
+    if runtime_error is not None:
+        return 1
+    return 1 if failures else 0
+
+
+# --------------------------------------------------------------------------- #
+# rollout
+# --------------------------------------------------------------------------- #
+
+
+def run_rollout(
+    rig: Rig,
+    *,
+    repo_id: str,
+    episodes: int = 1,
+    episode_seconds: float = 120.0,
+    fps: int = 30,
+    root: Path | None = None,
+    server: str | None = None,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+    num_steps: int = DEFAULT_MOLMOACT_NUM_STEPS,
+    enable_cuda_graph: bool = True,
+    jpeg_quality: int = DEFAULT_MOLMOACT_JPEG_QUALITY,
+    speed: float = 0.5,
+    chunk_size: int | None = None,
+    max_step_rad: float = DEFAULT_MAX_STEP_RAD,
+    max_effector_step: float = DEFAULT_MAX_EFFECTOR_STEP,
+    carry_targets: bool = False,
+    prefetch: bool = True,
+    prefetch_margin_s: float = DEFAULT_PREFETCH_MARGIN_S,
+    visualize: bool = True,
+    camera_overrides: dict[str, str] | None = None,
+    port: int = 8080,
+    mesh_dir: Path | None = None,
+    wait_between_episodes: bool = True,
+    backend_factory: Callable[[RigArm], ArmBackend] | None = None,
+    input_fn: Callable[[str], str] = input,
+) -> int:
+    """Record interactive, timed MolmoAct episodes as a LeRobot v3 dataset.
+
+    Each episode gets its own policy prompt. A completed episode is saved by
+    ``LeRobotSink`` before the arms are parked; a Ctrl-C saves the frames
+    already captured in the open episode and still runs the same safe park path
+    before the next prompt. Success/failure labels are written to a sidecar
+    manifest after parking because asking for a label must never hold the
+    motors energized.
+    """
+    from . import record as record_mod
+
+    if tuple(rig.names) != ("left", "right"):
+        raise ConfigurationError(
+            "policy rollouts require the packaged bimanual left/right YAM rig"
+        )
+    if episodes <= 0:
+        raise ConfigurationError("--episodes must be positive")
+    if episode_seconds <= 0:
+        raise ConfigurationError("--episode-seconds must be positive")
+    if fps <= 0:
+        raise ConfigurationError("--fps must be positive")
+    if not repo_id.strip():
+        raise ConfigurationError("--repo-id must not be empty")
+    if speed <= 0:
+        raise ConfigurationError("--speed must be positive")
+    if chunk_size is not None and chunk_size <= 0:
+        raise ConfigurationError("--chunk-size must be positive")
+    if chunk_size is not None and chunk_size > MOLMOACT_ACTION_HORIZON:
+        raise ConfigurationError(
+            f"--chunk-size cannot exceed the model horizon ({MOLMOACT_ACTION_HORIZON})"
+        )
+
+    client = MolmoActClient(
+        server,
+        timeout_s=request_timeout_s,
+        num_steps=num_steps,
+        jpeg_quality=jpeg_quality,
+        enable_cuda_graph=enable_cuda_graph,
+    )
+    client.health()
+    capture_rig = rig.with_camera_capture(fps=fps, pixel_format="rgb8")
+    cameras: dict[str, cameras_mod.CameraReader] = {}
+    scene = None
+    camera_panel = None
+    sink: object | None = None
+    manifest: dict[str, object] = {
+        "format": "openpi-control.inference-rollout-v1",
+        "dataset_format": "LeRobot v3.0",
+        "repo_id": repo_id,
+        "instruction_is_per_episode": True,
+        "speed": speed,
+        "chunk_size": (
+            chunk_size if chunk_size is not None else MOLMOACT_ACTION_HORIZON
+        ),
+        "episode_seconds": episode_seconds,
+        "fps": fps,
+        "partial_episodes_saved_on_ctrl_c": True,
+        "episodes": [],
+    }
+    manifest_path: Path | None = None
+    status = 0
+    try:
+        cameras = open_inference_cameras(capture_rig, overrides=camera_overrides)
+        shapes = record_mod.camera_shapes(cameras)
+        state_names = record_mod.arm_feature_names(
+            ["left", "right"], {"left": 6, "right": 6}
+        )
+        features = record_mod.build_features(state_names, shapes)
+        sink = record_mod.LeRobotSink(
+            repo_id=repo_id,
+            fps=fps,
+            features=features,
+            robot_type=record_mod.rig_robot_type(rig),
+            root=root,
+            image_writer_threads=4 * len(cameras),
+        )
+        manifest_path = sink.root / "openpi_control_rollouts.json"
+        _write_rollout_manifest(manifest_path, manifest)
+
+        if visualize:
+            from .viz import ArmSceneVisualizer, CameraPanel
+
+            scene = ArmSceneVisualizer.from_rig(rig, mesh_dir=mesh_dir, port=port)
+            camera_panel = CameraPanel(
+                scene.server, cameras, folder="Policy input", max_width=None
+            )
+            print(f"  viser    {scene.url}")
+
+        for episode_index in range(1, episodes + 1):
+            if episode_index > 1 and wait_between_episodes:
+                input_fn(
+                    "Reset the same towel to its starting pose, then press Enter to continue: "
+                )
+            prompt = _rollout_prompt(input_fn, episode_index, episodes)
+            print(f"\nEpisode {episode_index}/{episodes}: {prompt!r}")
+
+            session = None
+            live_arms: list[LiveArm] = []
+            source: InferenceRolloutSource | None = None
+            saved_before = getattr(sink, "num_episodes")
+            episode_result = None
+            park_failures = 0
+            try:
+                session, live_arms = power_up(
+                    rig, float_mode=False, backend_factory=backend_factory
+                )
+                arm_map = {entry.name: entry.arm for entry in live_arms}
+                limits = {
+                    name: (
+                        np.array(
+                            [spec.lower for spec in scene[name].joint_specs], dtype=np.float64
+                        )
+                        if scene is not None
+                        else np.full(6, -np.inf),
+                        np.array(
+                            [spec.upper for spec in scene[name].joint_specs], dtype=np.float64
+                        )
+                        if scene is not None
+                        else np.full(6, np.inf),
+                    )
+                    for name in ("left", "right")
+                }
+
+                def on_chunk(actions: np.ndarray) -> None:
+                    if scene is not None:
+                        scene.update_chunk(split_chunk(actions))
+                    if camera_panel is not None:
+                        camera_panel.push(served_frames(client))
+
+                def on_tick(
+                    states: Mapping[str, object],
+                    commands: Mapping[str, PositionCommand],
+                    consumed: int,
+                ) -> None:
+                    if scene is not None:
+                        for name, state in states.items():
+                            scene.update(name, state.joints.position_rad)  # type: ignore[union-attr]
+                        scene.set_chunk_progress(consumed)
+
+                source = InferenceRolloutSource(
+                    arms=arm_map,
+                    readers=cameras,
+                    client=client,
+                    instruction=prompt,
+                    episode_seconds=episode_seconds,
+                    fps=fps,
+                    speed=speed,
+                    chunk_size=chunk_size,
+                    max_step_rad=max_step_rad,
+                    max_effector_step=max_effector_step,
+                    limits=limits,
+                    prefetch=prefetch,
+                    prefetch_margin_s=prefetch_margin_s,
+                    carry_targets=carry_targets,
+                    on_chunk=on_chunk,
+                    on_tick=on_tick,
+                )
+                print(f"  rollout  {source.describe()}")
+                episode_result = record_mod.record_session(
+                    arms=arm_map,
+                    source=source,
+                    sink=sink,  # type: ignore[arg-type]
+                    task=prompt,
+                    fps=fps,
+                    cameras=cameras,
+                    num_episodes=0,
+                    finalize=False,
+                    save_on_interrupt=True,
+                )
+            finally:
+                if source is not None:
+                    source.close()
+                if scene is not None:
+                    scene.clear_chunk()
+                if session is not None:
+                    park_failures = power_down(session, live_arms, park=True)
+
+            if park_failures:
+                print(
+                    f"  {park_failures} arm(s) failed to park; stopping before the "
+                    "next episode",
+                    file=sys.stderr,
+                )
+                status = 1
+                break
+
+            saved = getattr(sink, "num_episodes") > saved_before
+            aborted = episode_result is not None and episode_result.ended_by == "interrupted"
+            if aborted:
+                if saved:
+                    print("  episode interrupted; partial frames were saved")
+                else:
+                    print("  episode interrupted before a frame was captured")
+            success = _rollout_yes_no(
+                input_fn, f"Episode {episode_index} successful? [y/n]: "
+            )
+            if not saved:
+                print("  no LeRobot episode was written for this attempt")
+            entries = manifest["episodes"]
+            assert isinstance(entries, list)
+            entries.append(
+                {
+                    "attempt": episode_index,
+                    "episode_index": saved_before if saved else None,
+                    "prompt": prompt,
+                    "success": success,
+                    "label": "y" if success else "n",
+                    "saved": saved,
+                    "aborted": aborted,
+                }
+            )
+            if manifest_path is not None:
+                _write_rollout_manifest(manifest_path, manifest)
+    except KeyboardInterrupt:
+        print("\nrollout session stopped; hardware shutdown completed")
+        status = 1
+    except (ConfigurationError, InferenceError, PiControlError) as err:
+        print(f"rollout stopped: {type(err).__name__}: {err}", file=sys.stderr)
+        status = 1
+    finally:
+        if sink is not None:
+            sink.finalize()  # type: ignore[attr-defined]
+        client.close()
+        cameras_mod.close_readers(cameras)
+        if scene is not None:
+            scene.server.stop()
+    return status
+
+
+def _rollout_prompt(input_fn: Callable[[str], str], index: int, total: int) -> str:
+    while True:
+        prompt = input_fn(f"Prompt for episode {index}/{total}: ").strip()
+        if prompt:
+            return prompt
+        print("The prompt cannot be empty.", file=sys.stderr)
+
+
+def _rollout_yes_no(input_fn: Callable[[str], str], message: str) -> bool:
+    while True:
+        value = input_fn(message).strip().lower()
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        print("Please enter y or n.", file=sys.stderr)
+
+
+def _write_rollout_manifest(path: Path, manifest: Mapping[str, object]) -> None:
+    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -1215,6 +1958,279 @@ def main(argv: list[str] | None = None) -> int:
     )
     live.add_argument("--list", action="store_true", help="describe the rig and exit")
 
+    infer = sub.add_parser(
+        "infer",
+        help="run bimanual YAM MolmoAct2 inference, execute chunks, and visualize them",
+    )
+    infer.add_argument(
+        "--rig", default="yam_bimanual", help="the trained bimanual YAM rig"
+    )
+    infer.add_argument(
+        "--interface",
+        action="append",
+        metavar="ARM=IFACE",
+        help="move one arm to a different bus, e.g. --interface left=can2 (repeatable)",
+    )
+    infer.add_argument(
+        "--server",
+        default="http://127.0.0.1:8202",
+        help="MolmoAct server URL or host:port; /act is appended automatically",
+    )
+    infer.add_argument(
+        "--instruction", required=True, help="language instruction sent with every observation"
+    )
+    infer.add_argument(
+        "--request-timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_S,
+        help="HTTP inference timeout in seconds (default: 60)",
+    )
+    infer.add_argument(
+        "--num-steps",
+        type=int,
+        default=DEFAULT_MOLMOACT_NUM_STEPS,
+        help="MolmoAct2 denoising steps requested from the server",
+    )
+    infer.add_argument(
+        "--no-cuda-graph",
+        dest="cuda_graph",
+        action="store_false",
+        help="stop requesting CUDA graph inference from the server (~20x slower)",
+    )
+    infer.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=DEFAULT_MOLMOACT_JPEG_QUALITY,
+        help="JPEG quality for frames on the wire; 0 sends them raw (default: 95)",
+    )
+    infer.add_argument(
+        "--raw-frames",
+        dest="jpeg_quality",
+        action="store_const",
+        const=0,
+        help="send raw HxWx3 frames, for a server that cannot decode encoded ones",
+    )
+    infer.add_argument(
+        "--control-rate",
+        type=float,
+        default=_MIRROR_RATE_HZ,
+        help="nominal action rate in Hz, also used to time the prefetch (default: 30)",
+    )
+    infer.add_argument(
+        "--speed",
+        type=float,
+        default=DEFAULT_CHUNK_SPEED,
+        help="play each chunk at this fraction of the training action rate "
+        "(0.5 = half speed, same path over twice the ticks; default: 1.0)",
+    )
+    infer.add_argument(
+        "--max-step-rad",
+        type=float,
+        default=DEFAULT_MAX_STEP_RAD,
+        help="maximum joint movement per executed action tick",
+    )
+    infer.add_argument(
+        "--max-effector-step",
+        type=float,
+        default=DEFAULT_MAX_EFFECTOR_STEP,
+        help="maximum normalized gripper movement per executed action tick "
+        "(default: 0.30, a full stroke in four ticks)",
+    )
+    infer.add_argument(
+        "--carry-targets",
+        action="store_true",
+        help="carry commanded joint targets across chunk boundaries instead of "
+        "re-seeding them from the measured pose, as the gripper already does",
+    )
+    infer.add_argument(
+        "--reach-actions",
+        action="store_true",
+        help="walk to every action in sub-steps, clamped against the measured pose",
+    )
+    infer.add_argument(
+        "--no-prefetch",
+        dest="prefetch",
+        action="store_false",
+        help="infer between chunks instead of during them, so the arms hold "
+        "still for a round trip at every chunk boundary",
+    )
+    infer.add_argument(
+        "--prefetch-margin-s",
+        type=float,
+        default=DEFAULT_PREFETCH_MARGIN_S,
+        help="margin added to the measured latency when timing a prefetch",
+    )
+    infer.add_argument(
+        "--reset-start-pose",
+        action="store_true",
+        help="ramp to the training start pose before the first observation",
+    )
+    infer.add_argument(
+        "--no-park",
+        dest="park",
+        action="store_false",
+        help="de-energize where the arms stand instead of parking at home_pos",
+    )
+    infer.add_argument(
+        "--no-viz",
+        dest="visualize",
+        action="store_false",
+        help="run inference and hardware without starting Viser",
+    )
+    infer.add_argument(
+        "--camera",
+        action="append",
+        metavar="NAME=DEVICE",
+        help="pin one camera to an explicit device (repeatable)",
+    )
+    infer.add_argument("--port", type=int, default=8080, help="viser HTTP port")
+    infer.add_argument(
+        "--mesh-dir", type=Path, default=None, help="directory holding the URDF's meshes"
+    )
+    infer.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="energize without running the doctor checks first",
+    )
+
+    rollout = sub.add_parser(
+        "rollout",
+        help="record interactive MolmoAct episodes as a LeRobot v3 dataset",
+    )
+    rollout.add_argument(
+        "--rig", default="yam_bimanual", help="the trained bimanual YAM rig"
+    )
+    rollout.add_argument(
+        "--interface",
+        action="append",
+        metavar="ARM=IFACE",
+        help="move an arm to a different CAN interface, e.g. left=can_left",
+    )
+    rollout.add_argument(
+        "--repo-id",
+        required=True,
+        help="local/Hub dataset id, e.g. Dimios45/openpi-fold-towel-rollout-ablation",
+    )
+    rollout.add_argument(
+        "--root", type=Path, default=None, help="local LeRobot dataset directory"
+    )
+    rollout.add_argument(
+        "--episodes", type=int, default=3, help="number of rollout attempts (default: 3)"
+    )
+    rollout.add_argument(
+        "--episode-seconds",
+        type=float,
+        default=120.0,
+        help="duration of each completed episode (default: 120)",
+    )
+    rollout.add_argument(
+        "--fps", type=int, default=30, help="recording and action-loop rate (default: 30)"
+    )
+    rollout.add_argument(
+        "--server",
+        default="http://127.0.0.1:8202",
+        help="MolmoAct server URL or host:port; /act is appended automatically",
+    )
+    rollout.add_argument(
+        "--request-timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_S,
+        help="HTTP inference timeout in seconds (default: 60)",
+    )
+    rollout.add_argument(
+        "--num-steps",
+        type=int,
+        default=DEFAULT_MOLMOACT_NUM_STEPS,
+        help="MolmoAct2 denoising steps requested from the server",
+    )
+    rollout.add_argument(
+        "--no-cuda-graph",
+        dest="cuda_graph",
+        action="store_false",
+        help="stop requesting CUDA graph inference from the server",
+    )
+    rollout.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=DEFAULT_MOLMOACT_JPEG_QUALITY,
+        help="JPEG quality for policy frames; 0 sends raw frames",
+    )
+    rollout.add_argument(
+        "--raw-frames",
+        dest="jpeg_quality",
+        action="store_const",
+        const=0,
+        help="send raw HxWx3 frames instead of JPEG-encoded frames",
+    )
+    rollout.add_argument(
+        "--speed",
+        type=float,
+        default=0.5,
+        help="play each policy chunk at this fraction of training speed (default: 0.5)",
+    )
+    rollout.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="execute only this prefix of each returned chunk (1-30; default: full chunk)",
+    )
+    rollout.add_argument(
+        "--max-step-rad",
+        type=float,
+        default=DEFAULT_MAX_STEP_RAD,
+        help="maximum joint movement per commanded step",
+    )
+    rollout.add_argument(
+        "--max-effector-step",
+        type=float,
+        default=DEFAULT_MAX_EFFECTOR_STEP,
+        help="maximum normalized gripper movement per commanded step",
+    )
+    rollout.add_argument(
+        "--carry-targets",
+        action="store_true",
+        help="carry commanded targets across policy chunk boundaries",
+    )
+    rollout.add_argument(
+        "--no-prefetch",
+        dest="prefetch",
+        action="store_false",
+        help="infer between chunks instead of during them",
+    )
+    rollout.add_argument(
+        "--prefetch-margin-s",
+        type=float,
+        default=DEFAULT_PREFETCH_MARGIN_S,
+        help="extra margin used when scheduling prefetched chunks",
+    )
+    rollout.add_argument(
+        "--no-reset-pause",
+        dest="wait_between_episodes",
+        action="store_false",
+        help="do not wait for manual towel reset between episodes",
+    )
+    rollout.add_argument(
+        "--no-viz",
+        dest="visualize",
+        action="store_false",
+        help="record inference without starting Viser",
+    )
+    rollout.add_argument(
+        "--camera",
+        action="append",
+        metavar="NAME=DEVICE",
+        help="pin one camera to an explicit device",
+    )
+    rollout.add_argument("--port", type=int, default=8080, help="viser HTTP port")
+    rollout.add_argument(
+        "--mesh-dir", type=Path, default=None, help="directory holding the URDF meshes"
+    )
+    rollout.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="energize without running doctor checks first",
+    )
+
     cams = sub.add_parser(
         "cameras", help="resolve a rig's cameras to device paths and say which are present"
     )
@@ -1349,12 +2365,14 @@ def main(argv: list[str] | None = None) -> int:
         "doctor": _command_doctor,
         "zero": _command_zero,
         "live": _command_live,
+        "infer": _command_infer,
+        "rollout": _command_rollout,
         "cameras": _command_cameras,
         "record": _command_record,
     }
     try:
         return commands[args.command](args, log_path)
-    except ConfigurationError as err:
+    except (ConfigurationError, InferenceError) as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
 
@@ -1529,6 +2547,110 @@ def _command_live(args: argparse.Namespace, log_path: Path) -> int:
         camera_overrides=cameras_mod.parse_camera_overrides(args.camera),
         port=args.port,
         mesh_dir=args.mesh_dir,
+    )
+    print(f"log: {log_path}")
+    return status
+
+
+def _command_infer(args: argparse.Namespace, log_path: Path) -> int:
+    """Preflight and run the hardware-coupled MolmoAct2 loop."""
+    rig = resolve_rig(args.rig).with_interfaces(_parse_interface_overrides(args.interface))
+    if rig.names != ("left", "right"):
+        raise ConfigurationError(
+            "infer currently supports only the packaged bimanual left/right YAM rig"
+        )
+
+    if not args.skip_preflight:
+        failures, reports = preflight_rig(rig)
+        for name, results in reports:
+            problems = [result for result in results if result.status != _OK]
+            summary = "all checks pass" if not problems else f"{len(problems)} to look at"
+            print(f"\npreflight {name}: {summary}")
+            for result in problems:
+                print(result.render())
+        if failures:
+            print(
+                f"\n{failures} failed check(s); nothing was energized. "
+                "Fix them, or re-run with --skip-preflight.",
+                file=sys.stderr,
+            )
+            return 1
+
+    status = run_infer(
+        rig,
+        instruction=args.instruction,
+        server=args.server,
+        request_timeout_s=args.request_timeout,
+        num_steps=args.num_steps,
+        enable_cuda_graph=args.cuda_graph,
+        jpeg_quality=args.jpeg_quality,
+        control_rate_hz=args.control_rate,
+        max_step_rad=args.max_step_rad,
+        max_effector_step=args.max_effector_step,
+        reach_actions=args.reach_actions,
+        speed=args.speed,
+        carry_targets=args.carry_targets,
+        prefetch=args.prefetch,
+        prefetch_margin_s=args.prefetch_margin_s,
+        reset_start_pose=args.reset_start_pose,
+        park=args.park,
+        visualize=args.visualize,
+        camera_overrides=cameras_mod.parse_camera_overrides(args.camera),
+        port=args.port,
+        mesh_dir=args.mesh_dir,
+    )
+    print(f"log: {log_path}")
+    return status
+
+
+def _command_rollout(args: argparse.Namespace, log_path: Path) -> int:
+    """Run interactive, labeled policy rollouts into a LeRobot dataset."""
+    rig = resolve_rig(args.rig).with_interfaces(_parse_interface_overrides(args.interface))
+    if rig.names != ("left", "right"):
+        raise ConfigurationError(
+            "rollout currently supports only the packaged bimanual left/right YAM rig"
+        )
+
+    if not args.skip_preflight:
+        failures, reports = preflight_rig(rig)
+        for name, results in reports:
+            problems = [result for result in results if result.status != _OK]
+            summary = "all checks pass" if not problems else f"{len(problems)} to look at"
+            print(f"\npreflight {name}: {summary}")
+            for result in problems:
+                print(result.render())
+        if failures:
+            print(
+                f"\n{failures} failed check(s); nothing was energized. "
+                "Fix them, or re-run with --skip-preflight.",
+                file=sys.stderr,
+            )
+            return 1
+
+    status = run_rollout(
+        rig,
+        repo_id=args.repo_id,
+        episodes=args.episodes,
+        episode_seconds=args.episode_seconds,
+        fps=args.fps,
+        root=args.root,
+        server=args.server,
+        request_timeout_s=args.request_timeout,
+        num_steps=args.num_steps,
+        enable_cuda_graph=args.cuda_graph,
+        jpeg_quality=args.jpeg_quality,
+        speed=args.speed,
+        chunk_size=args.chunk_size,
+        max_step_rad=args.max_step_rad,
+        max_effector_step=args.max_effector_step,
+        carry_targets=args.carry_targets,
+        prefetch=args.prefetch,
+        prefetch_margin_s=args.prefetch_margin_s,
+        visualize=args.visualize,
+        camera_overrides=cameras_mod.parse_camera_overrides(args.camera),
+        port=args.port,
+        mesh_dir=args.mesh_dir,
+        wait_between_episodes=args.wait_between_episodes,
     )
     print(f"log: {log_path}")
     return status

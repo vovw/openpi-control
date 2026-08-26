@@ -50,6 +50,20 @@ cameras = [
     "pyrealsense2>=2.55",
     "opencv-python-headless>=4.10",
 ]
+# MolmoAct2's robot-side HTTP client. The GPU model server remains a separate
+# process; this extra only installs what talking to /act needs.
+inference = [
+    # The wire codec: json_numpy is how ndarrays ride a JSON body.
+    "json-numpy>=1.0",
+    # requests, not urllib, because the reference client's keep-alive Session
+    # is part of the runtime being matched -- one TCP connection for every
+    # inference instead of a handshake per call.
+    "requests>=2.31",
+    # Frames go out JPEG-encoded (~25x less payload than raw). Pillow rather
+    # than reusing the `cameras` extra's OpenCV so this extra stays
+    # installable without the RealSense SDK.
+    "pillow>=10",
+]
 # Recording teleop into a LeRobot dataset (openpi_control.record). Split from
 # `cameras` because lerobot drags in torch, which a robot box that only drives
 # arms has no use for.
@@ -74,6 +88,25 @@ vr = [
     "mujoco>=3.2",
     "websockets>=13",
 ]
+
+# `uv sync` is an exact sync: it uninstalls whatever is not in the set it was
+# asked for, so `uv sync --extra cameras` used to silently strip the inference
+# and viz extras a live cell had just installed. This group is every extra an
+# operator box actually drives an arm with, and uv installs it on any plain
+# `uv sync` / `uv run`, so no single-extra command can undo the rest of them.
+#
+# A dependency-group rather than another extra on purpose: it is a development
+# and deployment convenience, so it stays out of the published wheel's metadata
+# -- `pip install openpi-control[cameras]` is unaffected by anything here.
+#
+# `lerobot` is deliberately absent: it drags in torch, which is gigabytes a box
+# that only drives arms never loads. Add it per-command when recording; because
+# this group is a default, `--extra lerobot` adds to it instead of replacing it.
+[dependency-groups]
+cell = ["openpi-control[dev,viz,cameras,inference,vr]"]
+
+[tool.uv]
+default-groups = ["cell"]
 
 [project.scripts]
 openpi-control = "openpi_control.cli:main"

@@ -468,6 +468,39 @@ def test_an_open_episode_is_discarded_when_the_session_ends() -> None:
     assert sink.finalized
 
 
+def test_an_interrupted_episode_can_be_saved_as_partial_data() -> None:
+    """Rollout recording keeps frames captured before Ctrl-C."""
+    sink = MemorySink()
+    source = ScriptedSource(
+        [
+            TeleopStep(targets={"left": target()}, event=EpisodeEvent.START),
+            TeleopStep(targets={"left": target()}),
+        ]
+    )
+    original_poll = source.poll
+
+    def interrupt_after_two_polls(states):
+        if source.polls >= 2:
+            raise KeyboardInterrupt
+        return original_poll(states)
+
+    source.poll = interrupt_after_two_polls  # type: ignore[method-assign]
+    result = record_session(
+        arms={"left": FakeArm()},
+        source=source,
+        sink=sink,
+        task="partial rollout",
+        report=lambda message: None,
+        save_on_interrupt=True,
+        **FAST,
+    )
+
+    assert result.ended_by == "interrupted"
+    assert result.discarded == 0
+    assert sink.num_episodes == 1
+    assert len(sink.episodes[0]) == 2
+
+
 def test_the_dataset_is_finalized_even_when_nothing_was_recorded() -> None:
     _, sink, _ = run([TeleopStep(event=EpisodeEvent.STOP)])
 

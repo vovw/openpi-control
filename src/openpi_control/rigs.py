@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .camera_poses import YAM_TOP_CAMERA_EXTRINSIC
 from .cameras import RigCamera
 from .config import (
     SUPPORTED_EFFECTORS,
@@ -53,15 +54,40 @@ ROLES = (ROLE_FOLLOWER, ROLE_LEADER)
 # cell that is built to a different width overrides the base positions.
 YAM_BIMANUAL_SEPARATION_M = 0.61
 
-# Serial numbers of the three RealSense D405s on the bimanual cell. A serial is
-# the only handle on a camera that survives a replug, so it -- not a /dev path
-# -- is what the rig pins. Swap a camera, edit the serial here; nothing else in
-# the tree needs to know.
+# Serial numbers of the RealSenses on the bimanual cell. A serial is the only
+# handle on a camera that survives a replug, so it -- not a /dev path -- is what
+# the rig pins. Swap a camera, edit the serial here; nothing else in the tree
+# needs to know.
+#
+# These are ASIC serials, the number in the /dev/v4l/by-id path, because that is
+# the one an operator can read off the bus without the SDK installed.
+# `cameras.sdk_serial_for_asic` bridges to the SDK's own serial when a stream is
+# actually opened.
+#
+# The wrists are D405s. The top is a D435 and differs in two ways that the rig
+# has to carry: it publishes no serial in its USB descriptor at all (so udev
+# cannot name it and discovery falls back to the SDK), and its colour sensor has
+# no 848x480 mode, so it captures at 640x480 -- see YAM_TOP_CAPTURE below.
 YAM_BIMANUAL_CAMERA_SERIALS = {
-    "top": "254623070531",
+    "top": "348523020354",
     "left_wrist": "254623070863",
     "right_wrist": "254623070417",
 }
+
+# 640x480 is a USB 2.0 fallback, not this camera's real capability, and it
+# should go away rather than be preserved.
+#
+# Enumerated on 2026-08-23 the top D435 offered only 424x240, 640x480,
+# 1280x720@15 and 1920x1080@8 -- the reduced set a D435 falls back to when it
+# negotiates USB 2.0. On USB 3 it also offers 848x480@30 and 640x360@30, and
+# 848x480 is both the rig default and 16:9. That matters beyond frame rate:
+# MolmoAct2's training frames are 640x360, so every other view this cell feeds
+# the policy is 16:9 and 640x480 is the one that is 4:3.
+#
+# So: re-seat this camera on a USB 3 port, re-run `openpi-control cameras`, and
+# if 848x480@30 is in `cameras.supported_color_modes("348523020354")`, delete
+# this override and let the top camera take the rig default like the wrists.
+YAM_TOP_CAPTURE = {"width": 640, "height": 480}
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +323,8 @@ def _yam_bimanual() -> Rig:
                 name="top",
                 serial=YAM_BIMANUAL_CAMERA_SERIALS["top"],
                 label="Top-down",
+                extrinsic=YAM_TOP_CAMERA_EXTRINSIC,
+                **YAM_TOP_CAPTURE,
             ),
             RigCamera(
                 name="left_wrist",

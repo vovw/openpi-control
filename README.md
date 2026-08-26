@@ -53,6 +53,25 @@ config = ArmConfig(
 See [docs/fr3.md](docs/fr3.md) for firmware, networking, controller, and
 hardware-validation details.
 
+## Installing
+
+```bash
+uv sync
+```
+
+That is the whole install for an operator box: cameras, MolmoAct2 inference,
+the viser scene, VR teleop, and the test tools all arrive together. `uv sync`
+is an *exact* sync -- it uninstalls whatever the command did not ask for -- so
+naming one extra at a time (`uv sync --extra cameras`) used to strip the extras
+a live cell had just installed. The `cell` dependency-group in `pyproject.toml`
+is a default group, so it is always included and no later `--extra` can drop it.
+
+`lerobot` is the one extra held back, because it pulls torch:
+
+```bash
+uv sync --extra lerobot   # adds to the default set, replaces nothing
+```
+
 ## Operator CLI
 
 `openpi-control` preflights an arm, sets its servo zeros, and brings a rig up
@@ -96,6 +115,56 @@ There is no separate `up` and `down`: `pi_control_node` holds a liveness pipe to
 the process that spawned it, so an arm cannot stay energized after the command
 returns. One foreground process owns the lifecycle, and ctrl-c is the way out.
 
+## Running MolmoAct2 on the YAM hardware
+
+The robot-side inference command uses the MolmoAct2 `/act` HTTP contract. Start
+the GPU inference server separately, then run the client on the robot box:
+
+```bash
+uv sync
+uv run openpi-control infer \
+    --server http://192.168.0.107:4090 \
+    --instruction "pick up the object"
+```
+
+It opens the three YAM cameras, powers both arms, executes whole action chunks
+with bounded interpolation, and serves a Viser page showing measured poses,
+camera previews, and translucent predicted end-effector trails. The command
+parks both arms at `home_pos` on Ctrl-C or an inference/hardware error.
+
+The wire defaults match the reference MolmoAct2 deployment -- CUDA-graph
+requests, JPEG frame transport, a keep-alive connection, full 30-action chunks.
+How those chunks are executed deliberately does not: `--reach-actions`,
+`--prefetch`, and `--reset-start-pose` switch the reference runtime on piece by
+piece. See [docs/inference.md](docs/inference.md) for the wire ordering and why.
+
+### Recording policy rollouts
+
+Install the LeRobot extra once, then use `rollout` for timed episodes. The
+command asks for a new prompt before every episode and asks `y/n` after each
+episode, including a Ctrl-C-interrupted partial episode. Ctrl-C stops only the
+current episode: its captured frames are saved, both arms park at `home_pos`,
+and the next episode starts after you reset the same towel.
+
+```bash
+uv sync --extra lerobot
+uv run openpi-control rollout \
+    --repo-id Dimios45/openpi-fold-towel-rollout-ablation \
+    --root ~/openpi-data/rollouts/fold-towel \
+    --episodes 3 \
+    --episode-seconds 120 \
+    --server http://192.168.0.107:4090 \
+    --interface left=can_left \
+    --interface right=can_right \
+    --speed 0.5 \
+    --port 8080
+```
+
+LeRobot v3 data is written under `--root`. The same directory receives
+`openpi_control_rollouts.json`, which stores the per-attempt prompt, whether
+the attempt was interrupted, and its `y/n` label. The dataset's `task` field
+also contains the prompt on every frame.
+
 ## Cameras
 
 Three RealSense D405s watch the bimanual cell: one overhead, one per wrist. They
@@ -103,7 +172,7 @@ are part of the rig, pinned by serial number — a `/dev/videoN` is not a camera
 it changes with boot order and which port you used.
 
 ```bash
-uv sync --extra cameras
+uv sync
 uv run openpi-control cameras                # what is plugged in, and where
 uv run openpi-control cameras --probe        # open each one and measure it
 ```
@@ -125,7 +194,7 @@ near 10-13 fps on the same node that `v4l2-ctl` streams at 30). See
 episodes as a LeRobot dataset — parquet for state and action, one mp4 per camera.
 
 ```bash
-uv sync --extra lerobot
+uv sync --extra lerobot   # torch, on top of the default set
 vr-teleop-relay                                     # in the vr-teleop-kit checkout
 uv run openpi-control record --repo-id you/yam-fold-towel \
     --task "fold the towel in half" --num-episodes 20 --vr-kit ~/vr-teleop-kit
@@ -153,7 +222,7 @@ other three ways a dataset comes out quietly wrong are in
 runs with the hardware down or absent.
 
 ```bash
-uv sync --extra viz
+uv sync
 uv run openpi-control-viz --fetch-meshes --model Yam     # once, needs network
 uv run openpi-control-viz --model Yam --effector E_Yam   # http://localhost:8080
 ```
@@ -193,6 +262,7 @@ owns the power-on and power-off that a live view implies. See
 | [docs/cli.md](docs/cli.md) | `doctor` checks, `zero` safeguards, rigs, `live` power on/off |
 | [docs/cameras.md](docs/cameras.md) | camera identity, discovery, the two D405 serials, capture rates |
 | [docs/recording.md](docs/recording.md) | LeRobot datasets, VR teleop, gripper polarity, episode boundaries |
+| [docs/inference.md](docs/inference.md) | MolmoAct2 HTTP inference, action chunks, and hardware execution |
 | [docs/viser.md](docs/viser.md) | render modes, mesh sourcing, rigs, joint ordering |
 | [docs/fr3.md](docs/fr3.md) | FR3 firmware, networking, controller, validation |
 | [docs/yam_teaching_handle.md](docs/yam_teaching_handle.md) | YAM handle CAN protocol and trigger calibration |

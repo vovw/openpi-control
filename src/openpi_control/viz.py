@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from . import meshes
+from .camera_poses import CameraExtrinsic
 from .config import SUPPORTED_EFFECTORS, SUPPORTED_MODELS, resolve_model_assets
 from .exceptions import ConfigurationError
 from .rigs import Rig, resolve_rig, rig_names
@@ -89,13 +90,46 @@ _PREVIEW_JPEG_QUALITY = 70
 _PREVIEW_PLACEHOLDER = (32, 34, 38)
 
 
-# Per-arm tints, so the arms of a bimanual scene stay tellable apart.
+# Per-arm tints, so the arms of a bimanual scene stay tellable apart. Blue and
+# amber for the first two, because they are the pair that survives the common
+# red-green colour-blindnesses -- but hue alone is not enough when the trails
+# are translucent and overlap, so the two are separated by *lightness* as well:
+# in greyscale they land 66 apart out of 255 (the earlier amber was 13 away
+# from the blue, effectively one colour to anyone not seeing hue).
 _ARM_COLORS = (
     (92, 132, 186),
-    (196, 128, 66),
+    (238, 172, 86),
     (118, 168, 118),
     (166, 118, 176),
 )
+
+# Every colour above is chosen against a dark canvas: on one, each arm tint
+# clears 4.5:1 and the amber axis markers reach 8.6:1, where on the white
+# canvas viser serves by default those same markers sit at 2.0:1 -- visible
+# only if you know where to look. `_PREVIEW_PLACEHOLDER` says the same thing:
+# it is meant to recede behind a camera tile, which it does at 1.1:1 on dark
+# and cannot at 15.9:1 on white. So the page that carries them asks for dark
+# mode rather than leaving the default and hoping.
+_PAGE_DARK_MODE = True
+# A GUI accent that is deliberately not one of the arm tints, so a highlighted
+# slider never reads as "the left arm".
+_PAGE_BRAND_COLOR = (96, 165, 168)
+
+
+def configure_page_theme(server: Any) -> None:
+    """Theme a viser page this package owns.
+
+    Only called for servers created here: handed someone else's server, the
+    caller owns its chrome and this would stomp it.
+    """
+    server.gui.configure_theme(
+        dark_mode=_PAGE_DARK_MODE,
+        brand_color=_PAGE_BRAND_COLOR,
+        # A share link publishes the page through viser's relay. These pages
+        # show a live robot cell, and nothing here should make sharing one a
+        # single stray click.
+        show_share_button=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,9 +262,13 @@ class ArmVisualizer:
 
         self._urdf, self.render_mode = self._load_urdf()
         self._joints = self._read_joint_specs()
+        self._end_link = self._urdf.joint_map[self._joints[-1].name].child
         self._positions = np.array([spec.rest for spec in self._joints], dtype=np.float64)
 
+        own_server = server is None
         self.server = server if server is not None else self._mods.viser.ViserServer(port=port)
+        if own_server:
+            configure_page_theme(self.server)
         self._root = root_node_name or f"/{self.name}"
         self._link_frames: dict[str, Any] = {}
         self._bones: list[Any] = []
@@ -336,8 +374,10 @@ class ArmVisualizer:
     def _find_missing_meshes(self) -> tuple[str, ...]:
         """Mesh files the URDF references that the mesh dir does not hold.
 
-        i2rt's YAM assets omit link_6_visual/collision.stl, so the wrist link
-        renders bare. Worth surfacing rather than leaving as a silent gap.
+        Those links render bare, which is worth surfacing rather than leaving as
+        a silent gap -- and is usually a sign the mesh source is looking in the
+        wrong place, as it was for YAM's wrist. A hand-built ``--mesh-dir`` can
+        simply be incomplete.
         """
         if self.mesh_dir is None:
             return ()
@@ -471,6 +511,56 @@ class ArmVisualizer:
         )
         self._refresh_link_frames()
 
+    def world_end_effector_position(
+        self, positions: Sequence[float] | Mapping[str, float] | np.ndarray
+    ) -> np.ndarray:
+        """Return the end-link position in the shared scene frame.
+
+        This is used by inference overlays. It evaluates the URDF temporarily
+        and restores the currently rendered pose before returning, so drawing
+        predicted points never changes the authoritative hardware render.
+        """
+        if hasattr(positions, "keys"):
+            values = np.array(
+                [
+                    float(positions.get(spec.name, current))  # type: ignore[union-attr]
+                    for spec, current in zip(self._joints, self._positions, strict=True)
+                ],
+                dtype=np.float64,
+            )
+        else:
+            values = np.asarray(positions, dtype=np.float64).reshape(-1)
+        if values.size != len(self._joints) or not np.all(np.isfinite(values)):
+            raise ConfigurationError(
+                f"{self.model} needs {len(self._joints)} finite joint positions for FK"
+            )
+        lower = np.array([spec.lower for spec in self._joints])
+        upper = np.array([spec.upper for spec in self._joints])
+        values = np.clip(values, lower, upper)
+        current = self._positions.copy()
+        try:
+            self._urdf.update_cfg(dict(zip(self.joint_names, values.tolist(), strict=True)))
+            local = np.asarray(
+                self._urdf.get_transform(self._end_link, self._urdf.base_link), dtype=np.float64
+            )[:3, 3]
+        finally:
+            self._urdf.update_cfg(dict(zip(self.joint_names, current.tolist(), strict=True)))
+        base = np.asarray(self.base_frame.position, dtype=np.float64)
+        w, x, y, z = (float(value) for value in self.base_frame.wxyz)
+        norm = float(np.linalg.norm((w, x, y, z)))
+        if norm <= 1e-12:
+            raise ConfigurationError(f"{self.name} has an invalid zero-length base quaternion")
+        w, x, y, z = (value / norm for value in (w, x, y, z))
+        rotation = np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+        return base + rotation @ local
+
     def _refresh_link_frames(self) -> None:
         so3 = self._mods.transforms.SO3
         base = self._urdf.base_link
@@ -590,15 +680,29 @@ class ArmSceneVisualizer:
         grid_size_m: float | None = None,
         initial_camera_position: Sequence[float] = (-1.1, -0.9, 0.8),
         initial_camera_look_at: Sequence[float] = (0.25, 0.0, 0.2),
+        camera_extrinsics: Mapping[str, CameraExtrinsic] | None = None,
     ) -> None:
         if not arms:
             raise ConfigurationError("an arm scene needs at least one arm")
         self.label = label
         mods = import_viz_modules()
+        own_server = server is None
         self.server = server if server is not None else mods.viser.ViserServer(port=port)
+        if own_server:
+            configure_page_theme(self.server)
+        self._trimesh = mods.trimesh
         self.server.scene.set_up_direction(up_axis)
 
         self.arms: dict[str, ArmVisualizer] = {}
+        self._arm_colors: dict[str, tuple[int, int, int]] = {}
+        self._chunk_handles: list[Any] = []
+        # Per-arm trail geometry, kept so advancing the chunk moves one marker
+        # instead of rebuilding the overlay. The trail itself never changes
+        # while a chunk executes, so it is built once and left alone.
+        self._chunk_segments: dict[str, list[Any]] = {}
+        self._chunk_points: dict[str, list[np.ndarray]] = {}
+        self._chunk_markers: dict[str, Any] = {}
+        self._chunk_consumed = 0
         for index, (name, spec) in enumerate(arms.items()):
             self.arms[name] = ArmVisualizer(
                 spec.model,
@@ -615,12 +719,16 @@ class ArmSceneVisualizer:
                 show_label=show_labels,
                 up_axis=None,
             )
+            self._arm_colors[name] = spec.color or _ARM_COLORS[index % len(_ARM_COLORS)]
 
         if show_grid:
             span = grid_size_m if grid_size_m is not None else self._grid_span()
             self.server.scene.add_grid(
                 "/ground", width=span, height=span, cell_size=0.05, section_size=0.25
             )
+
+        for name, extrinsic in (camera_extrinsics or {}).items():
+            self._add_camera_extrinsic(name, extrinsic)
 
         position = np.asarray(initial_camera_position, dtype=np.float32)
         look_at = np.asarray(initial_camera_look_at, dtype=np.float32)
@@ -653,7 +761,43 @@ class ArmSceneVisualizer:
             for arm in rig.arms
         }
         kwargs.setdefault("label", rig.name)
+        kwargs.setdefault(
+            "camera_extrinsics",
+            {
+                camera.name: camera.extrinsic
+                for camera in rig.cameras
+                if camera.extrinsic is not None
+            },
+        )
         return cls(specs, **kwargs)
+
+    def _add_camera_extrinsic(self, name: str, extrinsic: CameraExtrinsic) -> None:
+        """Show a calibrated camera frame in the rig's shared scene frame."""
+        if extrinsic.parent_frame != "midpoint":
+            raise ConfigurationError(
+                f"camera {name!r} is calibrated in unsupported frame "
+                f"{extrinsic.parent_frame!r}; expected 'midpoint'"
+            )
+        if name != extrinsic.name:
+            raise ConfigurationError(
+                f"camera pose name {extrinsic.name!r} does not match rig camera {name!r}"
+            )
+        position = extrinsic.position.astype(np.float32)
+        self.server.scene.add_frame(
+            f"/cameras/{name}",
+            show_axes=True,
+            axes_length=0.14,
+            axes_radius=0.008,
+            origin_radius=0.012,
+            wxyz=np.asarray(extrinsic.rotation_wxyz, dtype=np.float32),
+            position=position,
+        )
+        self.server.scene.add_label(
+            f"/cameras/{name}/label",
+            f"{name} camera",
+            position=position,
+            font_scene_height=0.04,
+        )
 
     def _grid_span(self) -> float:
         """A grid wide enough to sit under every arm base, with a margin."""
@@ -691,6 +835,136 @@ class ArmSceneVisualizer:
         """Render several arms at once. Arms left out keep their last pose."""
         for name, positions in poses.items():
             self.update(name, positions)
+
+    def clear_chunk(self) -> None:
+        """Remove the currently displayed predicted action chunk."""
+        for handle in self._chunk_handles:
+            try:
+                handle.remove()
+            except Exception:  # noqa: BLE001 - a disconnected browser is harmless
+                pass
+        self._chunk_handles.clear()
+        self._chunk_segments.clear()
+        self._chunk_points.clear()
+        self._chunk_markers.clear()
+        self._chunk_consumed = 0
+
+    def update_chunk(
+        self,
+        chunks: Mapping[str, Sequence[Sequence[float]] | np.ndarray],
+    ) -> None:
+        """Draw predicted end-effector trails for a bimanual action chunk.
+
+        Call this **once per chunk**, when the prediction arrives, and then
+        :meth:`set_chunk_progress` on each executed action.
+
+        Two things this deliberately does not do, each having been tried:
+
+        * It does not rebuild per tick. That cost 61 ms against the 33 ms tick
+          budget at the default 30 Hz -- 60 mesh removes, 62 forward-kinematics
+          evaluations and 60 mesh adds, every tick -- so the loop could not hold
+          its period and the arms were commanded at about half the intended
+          rate. The trail does not move while a chunk executes, so there is
+          nothing per tick to rebuild.
+        * It does not retire executed segments. Hiding them as they were
+          consumed drained the whole overlay to nothing over each chunk (60
+          segments to 0 in 1.0 s at 30 Hz) and left the scene empty through
+          every inference round trip, which reads as no overlay at all.
+
+        So the full predicted trail stays up for the life of the chunk, and
+        progress is one marker that moves along it.
+
+        The solid arm remains the measured pose. The overlay is intentionally a
+        trajectory rather than a second mesh copy per step: it stays readable in
+        a browser while showing where the policy intends to move next, and it
+        matches Karma's incremental command view.
+        """
+        self.clear_chunk()
+        for name, raw_chunk in chunks.items():
+            arm = self[name]
+            values = np.asarray(raw_chunk, dtype=np.float64)
+            if values.ndim != 2 or values.shape[1] < len(arm.joint_names):
+                raise ConfigurationError(
+                    f"chunk for {name} must have shape (N, at least {len(arm.joint_names)}), "
+                    f"got {values.shape}"
+                )
+            if values.shape[0] == 0:
+                continue
+            # Anchored at the pose the prediction was made from, not at wherever
+            # the arm has since travelled: the trail is what the policy asked
+            # for from that observation, so re-anchoring it mid-chunk would
+            # redraw history as though it had been predicted.
+            points = [arm.world_end_effector_position(arm.positions)]
+            points.extend(
+                arm.world_end_effector_position(row[: len(arm.joint_names)])
+                for row in values
+            )
+            color = self._arm_colors[name]
+            segments: list[Any] = []
+            for index, (start_point, end_point) in enumerate(
+                zip(points, points[1:], strict=False)
+            ):
+                # A predicted step that moves the flange nowhere has no cylinder
+                # to draw, but still holds its slot so the trail stays indexed
+                # by action number.
+                if float(np.linalg.norm(end_point - start_point)) < 1e-6:
+                    segments.append(None)
+                    continue
+                mesh = self._trimesh.creation.cylinder(
+                    radius=0.006,
+                    segment=np.asarray([start_point, end_point], dtype=np.float64),
+                    sections=10,
+                )
+                # Fades along the chunk so the near future reads brightest and
+                # the far end stays visible.
+                mesh.visual.face_colors = (*color, max(60, 220 - index * 5))
+                handle = self.server.scene.add_mesh_trimesh(
+                    f"/predicted_chunk/{name}/segment_{index:03d}", mesh
+                )
+                segments.append(handle)
+                self._chunk_handles.append(handle)
+
+            # How far along the chunk the arm is. Built at the origin and placed
+            # by ``position`` so advancing it is one cheap transform update
+            # rather than new geometry. It also carries the whole overlay for a
+            # chunk the policy predicted as a hold, where every segment is
+            # degenerate and nothing else would be drawn.
+            marker_mesh = self._trimesh.creation.icosphere(radius=0.014, subdivisions=2)
+            marker_mesh.visual.face_colors = (*color, 235)
+            marker = self.server.scene.add_mesh_trimesh(
+                f"/predicted_chunk/{name}/progress", marker_mesh
+            )
+            marker.position = np.asarray(points[0], dtype=np.float32)
+            self._chunk_handles.append(marker)
+            self._chunk_markers[name] = marker
+            self._chunk_segments[name] = segments
+            self._chunk_points[name] = points
+
+    def set_chunk_progress(self, consumed: int) -> None:
+        """Move the progress marker to the ``consumed``-th action of the chunk.
+
+        Cheap enough for the control loop: one transform update per arm, ~1 us
+        against the 61 ms a rebuild costs. The trail itself is left alone --
+        every predicted step stays on screen for the life of the chunk, so the
+        overlay does not thin out as the arm works through it.
+        """
+        if not self._chunk_points:
+            return
+        consumed = max(0, int(consumed))
+        if consumed == self._chunk_consumed:
+            return
+        for name, points in self._chunk_points.items():
+            marker = self._chunk_markers.get(name)
+            if marker is None:
+                continue
+            # A chunk shorter than the tick count (or a final tick that indexes
+            # one past the last action) parks the marker at the chunk's end.
+            index = min(consumed, len(points) - 1)
+            try:
+                marker.position = np.asarray(points[index], dtype=np.float32)
+            except Exception:  # noqa: BLE001 - a disconnected browser is harmless
+                pass
+        self._chunk_consumed = consumed
 
     def add_gui(self) -> None:
         """One folder of sliders per arm, plus a scene-wide reset."""
@@ -742,12 +1016,17 @@ class CameraPanel:
         readers: Mapping[str, Any],
         *,
         folder: str = "Cameras",
-        max_width: int = _PREVIEW_MAX_WIDTH,
+        max_width: int | None = _PREVIEW_MAX_WIDTH,
         rate_hz: float = _PREVIEW_RATE_HZ,
         jpeg_quality: int = _PREVIEW_JPEG_QUALITY,
+        image_format: str = "jpeg",
     ) -> None:
-        if max_width <= 0:
+        if max_width is not None and max_width <= 0:
             raise ConfigurationError("a camera preview needs a positive max_width")
+        if image_format not in ("jpeg", "png"):
+            raise ConfigurationError(
+                f"a camera preview is served as jpeg or png, not {image_format!r}"
+            )
         if rate_hz <= 0:
             raise ConfigurationError("a camera preview needs a positive rate_hz")
         self.server = server
@@ -755,6 +1034,7 @@ class CameraPanel:
         self._max_width = max_width
         self._period = 1.0 / rate_hz
         self._jpeg_quality = jpeg_quality
+        self._image_format = image_format
         self._since_push = self._period  # push on the first step, not a tick late
         self._pushed: dict[str, int] = {}
         self._tiles: dict[str, Any] = {}
@@ -765,7 +1045,7 @@ class CameraPanel:
                 self._tiles[name] = server.gui.add_image(
                     placeholder,
                     label=self._label(name, reader),
-                    format="jpeg",
+                    format=image_format,
                     jpeg_quality=jpeg_quality,
                 )
 
@@ -800,6 +1080,23 @@ class CameraPanel:
                 frame, self._max_width, pixel_format=getattr(reader, "pixel_format", "bgr8")
             )
 
+    def push(self, frames: Mapping[str, np.ndarray], *, pixel_format: str = "rgb8") -> None:
+        """Show frames the caller supplies, bypassing the readers and the clock.
+
+        A preview that has to answer "what did the model see" cannot take its
+        own picture beside the one that went over the wire -- it has to show
+        that one. ``infer`` hands over the decoded observation, so every image
+        on the page is a frame the policy was actually given.
+
+        Unthrottled on purpose: the caller pushes when an observation exists,
+        which is once per inference rather than once per control tick.
+        """
+        for name, frame in frames.items():
+            tile = self._tiles.get(name)
+            if tile is None or frame is None:
+                continue
+            tile.image = _thumbnail(frame, self._max_width, pixel_format=pixel_format)
+
     def remove(self) -> None:
         """Drop every tile from the GUI. The readers are the caller's to close."""
         for tile in self._tiles.values():
@@ -807,13 +1104,75 @@ class CameraPanel:
         self._tiles.clear()
 
 
-def _thumbnail(frame: np.ndarray, max_width: int, *, pixel_format: str = "bgr8") -> np.ndarray:
+class GripperPanel:
+    """A numeric gripper readout, because the render cannot show one.
+
+    The packaged YAM URDF has six actuated joints. The gripper is not one of
+    them -- its geometry is baked into ``link_6``'s mesh (see
+    :mod:`openpi_control.meshes`), so the jaws on the page are the same jaws at
+    every gripper position, and an operator reading the render will see them
+    "closed" whatever the hardware is doing. That is a trap worth closing with
+    two numbers rather than a mesh: what the gripper was commanded, and what it
+    reports back, per arm, normalized with 1.0 open.
+
+    The two disagreeing by a lot, or the measured value never moving while the
+    commanded one does, is the signature of a gripper servo zeroed at the wrong
+    stop -- see :class:`openpi_control.inference.GripperWatch`, which raises the
+    same failure on the console.
+    """
+
+    def __init__(self, server: Any, names: Sequence[str], *, folder: str = "Gripper") -> None:
+        self.server = server
+        self._rows: dict[str, Any] = {}
+        with server.gui.add_folder(folder):
+            server.gui.add_markdown("normalized, **1.0 = open**")
+            for name in names:
+                self._rows[name] = server.gui.add_text(
+                    name, initial_value="commanded — / measured —", disabled=True
+                )
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._rows)
+
+    def update(
+        self,
+        commanded: Mapping[str, float | None],
+        measured: Mapping[str, float | None],
+        *,
+        stalled: Sequence[str] = (),
+    ) -> None:
+        """Refresh each arm's row. Missing values render as an em dash."""
+        flagged = set(stalled)
+        for name, row in self._rows.items():
+            want = commanded.get(name)
+            got = measured.get(name)
+            text = (
+                f"commanded {'—' if want is None else f'{want:.3f}'} / "
+                f"measured {'—' if got is None else f'{got:.3f}'}"
+            )
+            row.value = f"{text}  NOT TRACKING" if name in flagged else text
+
+    def remove(self) -> None:
+        for row in self._rows.values():
+            row.remove()
+        self._rows.clear()
+
+
+def _thumbnail(
+    frame: np.ndarray, max_width: int | None, *, pixel_format: str = "bgr8"
+) -> np.ndarray:
     """A small RGB copy of one capture frame.
 
     Subsampling by stride rather than resampling is what lets a preview cost one
     numpy copy and no OpenCV: capture already refuses to depend on cv2, and a
     thumbnail whose only job is to show aim and lighting gains nothing from
     interpolation.
+
+    ``max_width`` of ``None`` subsamples nothing and hands the frame over at its
+    capture resolution. That is what a preview asked to answer "what did the
+    model see" needs: a strided copy is a different picture from the one that
+    went over the wire.
 
     The channel order is asked for, not assumed -- a reader opened as ``rgb8``
     (which is what the dataset recorder does) would come out with red and blue
@@ -823,7 +1182,7 @@ def _thumbnail(frame: np.ndarray, max_width: int, *, pixel_format: str = "bgr8")
         raise ConfigurationError(
             f"a camera preview wants an HxWx3 frame, got shape {frame.shape}"
         )
-    stride = max(1, -(-frame.shape[1] // max_width))
+    stride = 1 if max_width is None else max(1, -(-frame.shape[1] // max_width))
     step = 1 if pixel_format == "rgb8" else -1
     return np.ascontiguousarray(frame[::stride, ::stride, ::step])
 

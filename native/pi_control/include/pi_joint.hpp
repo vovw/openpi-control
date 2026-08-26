@@ -4,6 +4,8 @@
  */
 
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <vector>
 
@@ -364,6 +366,31 @@ class Joint {
 
     bool has_normalized_position_range() const {
         return normalized_pos_min_configured_ && normalized_pos_max_configured_;
+    }
+
+    /*!
+     * @brief Replaces the configured normalized range with a measured one.
+     *
+     * A gripper's normalized [0, 1] is only as good as the two relative
+     * positions it spans. Asserting them in config assumes the stroke and the
+     * feedback frame agree with the unit in front of you; measuring them at
+     * startup does not. ``closed`` maps to normalized 0.0 and ``open`` to 1.0,
+     * whichever way round they sit in the joint frame.
+     *
+     * @param closed Relative position of the closed stop, in radian.
+     * @param open_ Relative position of the open stop, in radian.
+     */
+    ReturnCode set_normalized_position_range(float closed, float open_) {
+        if (!std::isfinite(closed) || !std::isfinite(open_) || closed == open_) {
+            PI_ERROR("Joint %d: measured gripper range [%.3f, %.3f] is not usable", id_,
+                     closed, open_);
+            return ReturnCode::INVALID_PARAM;
+        }
+        normalized_pos_min_ = std::min(closed, open_);
+        normalized_pos_max_ = std::max(closed, open_);
+        normalized_pos_min_configured_ = true;
+        normalized_pos_max_configured_ = true;
+        return ReturnCode::SUCCESS;
     }
 
     float get_normalized_pos_min_relative() {

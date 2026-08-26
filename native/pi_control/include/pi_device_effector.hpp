@@ -235,6 +235,25 @@ class DeviceEffector : public Device {
     EffectorControlMode get_control_mode() { return control_mode_; }
 
     /*!
+     * @brief Measures the gripper's two mechanical stops and normalizes to them.
+     *
+     * Ported from i2rt's ``detect_gripper_limits``, and here for the same
+     * reason it exists there: a configured stroke is a claim about the unit in
+     * front of you, and for a gripper whose travel exceeds one feedback turn
+     * it is a claim the feedback cannot even confirm. Nudge the jaws into each
+     * stop with a small torque, watch where the position stops changing, and
+     * take those two readings as normalized 0.0 and 1.0.
+     *
+     * Which of the two is *closed* is not measured -- that is ``open_at_min``,
+     * a fact about how the gripper is built rather than about this boot.
+     *
+     * No-op unless the effector config sets ``needs_calibration``. Moves the
+     * jaws, so it runs during start(), before the ready move, and never while
+     * the device is following anything.
+     */
+    ReturnCode calibrate_gripper_limits();
+
+    /*!
      * @brief Returns the effective control mode used for servo/driver configuration.
      *
      * Why this exists:
@@ -313,4 +332,5 @@ class DeviceEffector : public Device {
     float distance_to_torque_ = 0.0f;             ///< Distance-to-torque conversion factor (Nm/rad).
     float grip_spring_offset_ = 0.0f;             ///< Torque-mode spring offset (rad), subtracted from the position error; a per-installation zero trim -- prefer adjusting the servo zero.
     bool open_at_min_ = false;              ///< Open side of the effector: true if open at min position, false if open at max position.
+    bool needs_calibration_ = false;        ///< Measure the gripper's two stops at startup instead of trusting the configured range.
 };

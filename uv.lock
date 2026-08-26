@@ -865,6 +865,19 @@ wheels = [
 ]
 
 [[package]]
+name = "json-numpy"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/41/c37467c113c72742501c45974f70efbec94243cd357b93e18a1dc205a54a/json_numpy-2.1.1.tar.gz", hash = "sha256:3e6260fc29626e7a6a60d52a1f9ad8f522a9051f57ac55d5dfdeeaba55d4a835", size = 9032, upload-time = "2025-06-30T03:11:48.042Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cc/61/7bec579093bc5f8da7f308a319e0d9372409f4bc0f7ea95588051b8cf139/json_numpy-2.1.1-py3-none-any.whl", hash = "sha256:91e45b756c1345f478651c3d7e767a7488335f34a3d500ef7829b917a8043c28", size = 5493, upload-time = "2025-06-30T03:10:56.823Z" },
+]
+
+[[package]]
 name = "jsonlines"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1688,6 +1701,11 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
+inference = [
+    { name = "json-numpy" },
+    { name = "pillow" },
+    { name = "requests" },
+]
 lerobot = [
     { name = "lerobot", extra = ["dataset"], marker = "python_full_version >= '3.12'" },
     { name = "opencv-python-headless", version = "4.11.0.86", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1703,27 +1721,38 @@ vr = [
     { name = "websockets" },
 ]
 
+[package.dev-dependencies]
+cell = [
+    { name = "openpi-control", extra = ["cameras", "dev", "inference", "viz", "vr"] },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6" },
+    { name = "json-numpy", marker = "extra == 'inference'", specifier = ">=1.0" },
     { name = "lerobot", extras = ["dataset"], marker = "python_full_version >= '3.12' and extra == 'lerobot'", specifier = ">=0.6" },
     { name = "mujoco", marker = "extra == 'vr'", specifier = ">=3.2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "opencv-python-headless", marker = "extra == 'cameras'", specifier = ">=4.10" },
     { name = "openpi-control", extras = ["cameras"], marker = "extra == 'lerobot'" },
+    { name = "pillow", marker = "extra == 'inference'", specifier = ">=10" },
     { name = "pyrealsense2", marker = "extra == 'cameras'", specifier = ">=2.55" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5" },
     { name = "python-can", specifier = ">=4.3" },
     { name = "pyzmq", specifier = ">=25" },
+    { name = "requests", marker = "extra == 'inference'", specifier = ">=2.31" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "trossen-arm", specifier = "==1.10.0" },
     { name = "viser", marker = "extra == 'viz'", specifier = ">=1.0" },
     { name = "websockets", marker = "extra == 'vr'", specifier = ">=13" },
     { name = "yourdfpy", marker = "extra == 'viz'", specifier = ">=0.0.56" },
 ]
-provides-extras = ["dev", "viz", "cameras", "lerobot", "vr"]
+provides-extras = ["dev", "viz", "cameras", "inference", "lerobot", "vr"]
+
+[package.metadata.requires-dev]
+cell = [{ name = "openpi-control", extras = ["dev", "viz", "cameras", "inference", "vr"] }]
 
 [[package]]
 name = "packaging"

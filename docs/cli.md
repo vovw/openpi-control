@@ -8,6 +8,8 @@ is sane, set each servo's firmware zero, and bring a whole rig up and back down.
 | `doctor` | no, unless given `--probe` (which only ever reads) |
 | `zero` | writes servo firmware; confirms first |
 | `live` | **energizes the arms**, and owns putting them down again |
+| `infer` | **energizes the bimanual YAM**, executes MolmoAct2 chunks, and owns putting it down again |
+| `rollout` | **energizes the bimanual YAM**, records LeRobot v3 episodes, and owns putting it down again |
 | `cameras` | no, unless given `--probe` (which opens camera streams, not the bus) |
 | `record` | **energizes the arms** and teleoperates them, like `live` |
 
@@ -123,8 +125,17 @@ About to write a new firmware zero on Yam via can_follower_r:
 
 The arm's CURRENT physical pose becomes zero for every servo listed.
 Move it to the intended zero pose and support it before continuing.
+
+  joint 7 (E_Yam) is the GRIPPER. Its zero must be the FULLY CLOSED stop.
+  ...
 Type 'zero' to proceed:
 ```
+
+> **The gripper's zero is measured, not written.** `E_Yam` ships
+> `needs_calibration`, so the node finds the gripper's two mechanical stops at
+> every startup and normalizes to those (see `docs/inference.md`). Zeroing
+> joint 7 only shifts the frame that calibration then anchors, so it is rarely
+> the thing you want; if you do it, do it with the jaws shut.
 
 | Flag | Meaning |
 | --- | --- |
@@ -195,6 +206,93 @@ no-op — a typo that silently left the arm on its default bus is the one failur
 here worth being loud about. (On `doctor` the flag is spelled
 `--interface-override`, because `--interface` there already means a single arm's
 bus.)
+
+## infer
+
+`infer` is the hardware-side MolmoAct2 client for `yam_bimanual`. It requires
+both YAM followers and all three trained camera views. Start the GPU policy
+server separately, then run:
+
+```bash
+uv sync
+uv run openpi-control infer \
+    --server http://192.168.0.107:4090 \
+    --instruction "pick up the object"
+```
+
+The client sends `top`, `left_wrist`, and `right_wrist` as the model's
+`top_cam`, `left_cam`, and `right_cam`, with a 14-value left/right state. The
+every action of every returned chunk is executed, one bounded command per
+control tick. Viser shows measured arm poses, translucent predicted
+end-effector trails, and a "Policy input" panel holding the three frames the
+model was actually handed, at capture resolution.
+
+The wire defaults match the reference deployment; the three flags that change
+how the chunk is *executed* are opt-in, because matching the reference there
+behaved worse on this rig. See [inference.md](inference.md).
+
+| Flag | Meaning |
+| --- | --- |
+| `--server` | MolmoAct server URL or host:port; `/act` is appended |
+| `--instruction` | language instruction sent with every observation (required) |
+| `--request-timeout` | HTTP timeout in seconds (default 60) |
+| `--num-steps` | model denoising steps requested from the server (default 10) |
+| `--no-cuda-graph` | stop requesting CUDA graph inference (~20x slower) |
+| `--raw-frames` / `--jpeg-quality` | frame transport; JPEG q95 by default |
+| `--reach-actions` | walk to every action in sub-steps (the reference runtime) |
+| `--prefetch` | infer the next chunk while this one is still executing |
+| `--prefetch-margin-s` | margin added to measured latency when prefetching |
+| `--reset-start-pose` | ramp to the training start pose before the first chunk |
+| `--control-rate` | nominal action rate in Hz, used to time the prefetch |
+| `--max-step-rad` | maximum joint movement per commanded step (default 0.10) |
+| `--max-effector-step` | maximum normalized gripper movement per commanded step |
+| `--no-park` | de-energize in place instead of parking at `home_pos` |
+| `--no-viz` | run the client without starting Viser |
+| `--camera NAME=DEVICE` | pin a camera to an explicit device |
+| `--interface ARM=IFACE` | move an arm to another CAN interface |
+| `--skip-preflight` | energize without doctor checks |
+
+Inference and stale-state failures stop commanding before the normal park and
+de-energize sequence runs. See [inference.md](inference.md) for full wire
+ordering and setup.
+
+## rollout
+
+`rollout` records timed, interactive MolmoAct2 policy attempts as LeRobot v3
+episodes. It asks for a new language prompt before every attempt, waits for
+the same towel to be reset, and asks for a `y/n` success label only after the
+arms have safely parked. Ctrl-C interrupts the current attempt, saves all
+frames captured so far as a partial episode, parks at `home_pos`, and continues
+to the next prompt.
+
+```bash
+uv sync --extra lerobot
+uv run openpi-control rollout \
+    --repo-id Dimios45/openpi-fold-towel-rollout-ablation \
+    --root ~/openpi-data/rollouts/fold-towel \
+    --episodes 3 --episode-seconds 120 \
+    --server http://192.168.0.107:4090 \
+    --interface left=can_left --interface right=can_right \
+    --speed 0.5 --port 8080
+```
+
+The dataset directory also contains `openpi_control_rollouts.json`, which
+keeps the per-attempt prompt, saved episode index, interruption flag, and
+success label. The prompt is additionally written to every frame's LeRobot
+`task` field. Viser is available at `http://<robot-box>:8080` during the run.
+
+| Flag | Meaning |
+| --- | --- |
+| `--episodes` | number of attempts (default 3) |
+| `--episode-seconds` | maximum duration per attempt (default 120) |
+| `--speed` | action playback speed (default 0.5) |
+| `--chunk-size` | use a prefix of each returned action chunk, 1–30 |
+| `--no-prefetch` | infer synchronously between chunks |
+| `--no-reset-pause` | skip the manual reset prompt between attempts |
+| `--no-viz` | disable Viser |
+| `--interface ARM=IFACE` | override an arm's CAN interface |
+| `--camera NAME=DEVICE` | pin a camera to a device |
+| `--skip-preflight` | energize without doctor checks |
 
 ## live
 
@@ -425,7 +523,7 @@ dataset. Energizes the arms and owns putting them down again, exactly like
 `live`.
 
 ```bash
-uv sync --extra lerobot
+uv sync --extra lerobot   # torch, on top of the default set
 vr-teleop-relay                                    # in the vr-teleop-kit checkout
 uv run openpi-control record --repo-id you/task \
     --task "fold the towel" --num-episodes 20 --vr-kit ~/vr-teleop-kit
