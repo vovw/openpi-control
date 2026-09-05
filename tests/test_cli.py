@@ -856,6 +856,7 @@ def test_record_preflight_treats_a_missing_camera_as_fatal(
 
 def test_record_narrows_cameras_with_only(fake_camera_bus, monkeypatch, capsys) -> None:
     fake_camera_bus(["348523020354", "254623070417"])
+    monkeypatch.setattr(buses, "check_interface", lambda *a, **k: None)
     seen: dict[str, object] = {}
 
     def fake_run(rig, **kwargs):
@@ -864,7 +865,7 @@ def test_record_narrows_cameras_with_only(fake_camera_bus, monkeypatch, capsys) 
         return 0
 
     monkeypatch.setattr(cli, "run_record", fake_run)
-    cli.main(["record", "--dry-run", "--task", "t", "--only", "right"])
+    assert cli.main(["record", "--dry-run", "--task", "t", "--only", "right"]) == 0
 
     assert seen["arms"] == ("right",)
     assert seen["cameras"] == ("top", "right_wrist")

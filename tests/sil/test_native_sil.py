@@ -517,7 +517,26 @@ def test_gripper_stops_are_measured_at_startup_past_one_feedback_turn(fake_bus_w
             timeout_s=5.0,
             what="the measured open stop to report fully open",
         )
-        fake_bus_with_gripper.set_position(7, 0.0)
+
+        def move_gripper(position: float) -> None:
+            # A single-turn encoder cannot distinguish a teleported full turn
+            # from no motion. Feed bounded steps and wait for each observation
+            # so turn tracking sees the path even on a slow CI runner.
+            start = fake_bus_with_gripper.position(7)
+            steps = max(1, int(abs(position - start) / 0.25) + 1)
+            for step in range(1, steps + 1):
+                current = start + (position - start) * step / steps
+                fake_bus_with_gripper.set_position(7, current)
+                expected = abs(current) / 6.57
+                wait_for(
+                    lambda expected=expected: abs(
+                        follower.read_state(timeout_s=2.0).effector.position - expected
+                    ) < 0.015,
+                    timeout_s=5.0,
+                    what=f"gripper feedback at {current:.3f} rad",
+                )
+
+        move_gripper(0.0)
         wait_for(
             lambda: follower.read_state(timeout_s=2.0).effector.position < 0.03,
             timeout_s=5.0,
@@ -526,7 +545,7 @@ def test_gripper_stops_are_measured_at_startup_past_one_feedback_turn(fake_bus_w
 
         # Mid-travel lands where the measured stroke says it should, not where
         # the configured 4.5 rad would have put it.
-        fake_bus_with_gripper.set_position(7, -3.285)
+        move_gripper(-3.285)
         wait_for(
             lambda: abs(follower.read_state(timeout_s=2.0).effector.position - 0.5) < 0.05,
             timeout_s=5.0,
