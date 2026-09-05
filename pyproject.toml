@@ -83,8 +83,8 @@ lerobot = [
 # Driving the arms from a Quest headset (openpi_control.teleop_vr). These are
 # vr-teleop-kit's own runtime dependencies -- its IK loads the YAM MJCF through
 # mujoco, and it reaches the relay over a WebSocket -- listed here because the
-# kit is a sibling checkout rather than a package we depend on, so nothing else
-# would install them. The kit itself comes from that checkout (--vr-kit).
+# kit is a Git submodule rather than a package we depend on, so nothing else
+# would install them. The kit itself comes from external/vr-teleop-kit (override with --vr-kit).
 vr = [
     "mujoco>=3.2",
     "websockets>=13",
@@ -136,6 +136,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["external"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

@@ -18,13 +18,13 @@ the adapter: it turns that project's ``BiQuestTeleoperator`` into a
 Setup, once
 -----------
 
-``vr-teleop-kit`` is not a dependency of this package -- it is a sibling
-checkout, because it carries its own relay, its own web assets, and an i2rt
-clone for the YAM MJCF the IK needs. Point ``--vr-kit`` at it (or install it
-into this environment), then run its relay next to this command::
+Initialize ``external/vr-teleop-kit`` with ``git submodule update --init
+--recursive``. The checkout is discovered automatically; ``--vr-kit`` selects
+another path. Fetch the i2rt model files separately and set ``YAM_XML``.
+See ``docs/vr.md`` for relay and model setup::
 
-    vr-teleop-relay                 # in the vr-teleop-kit checkout
-    openpi-control record --vr ...  # here
+    uv run --project external/vr-teleop-kit --no-sync vr-teleop-relay
+    uv run --no-sync openpi-control teleop
 
 Three things that will otherwise cost you a session
 ---------------------------------------------------
@@ -248,7 +248,7 @@ class QuestTeleopSource:
 def _import_vr_kit(kit_path: Path | None):  # noqa: ANN202 - the module, Any by design
     """Import ``vr_teleop_kit.lerobot.bi_quest_teleop``, from a checkout if given.
 
-    ``vr-teleop-kit`` is a sibling project rather than a dependency, so a path
+    ``vr-teleop-kit`` is a submodule rather than a package dependency, so a path
     to its checkout is prepended to ``sys.path`` when one is given. The import
     error is worth catching because the fix ("point --vr-kit at the checkout")
     is not obvious from a bare ModuleNotFoundError.

@@ -1,0 +1,3 @@
+[submodule "external/vr-teleop-kit"]
+	path = external/vr-teleop-kit
+	url = https://github.com/vovw/vr-teleop-kit.git
