@@ -88,10 +88,10 @@ uv run openpi-control doctor --rig yam_bimanual
 ```
 doctor: rig yam_bimanual — two YAM followers, each with an E_Yam gripper
 
-left (Yam on can0):
+left (Yam on can_left):
   [OK  ] packaged assets            Yam.json, Yam_01.json, E_Yam.json
   ...
-right (Yam on can1):
+right (Yam on can_right):
   ...
 
 2 arms, 0 failed, 2 warned
@@ -187,7 +187,7 @@ uv run openpi-control-viz --list-rigs      # same rigs, from the viz side
 
 | Rig | Arms | Cameras |
 | --- | --- | --- |
-| `yam_bimanual` | `left` (Yam + E_Yam, can0), `right` (Yam + E_Yam, can1) | `top`, `left_wrist`, `right_wrist` (D405s) |
+| `yam_bimanual` | `left` (Yam + E_Yam, can_left), `right` (Yam + E_Yam, can_right) | `top`, `left_wrist`, `right_wrist` (D405s) |
 
 Two flags adapt a packaged rig to the cell in front of you, on any command that
 takes a rig:
@@ -224,8 +224,8 @@ The client sends `top`, `left_wrist`, and `right_wrist` as the model's
 `top_cam`, `left_cam`, and `right_cam`, with a 14-value left/right state. The
 every action of every returned chunk is executed, one bounded command per
 control tick. Viser shows measured arm poses, translucent predicted
-end-effector trails, and a "Policy input" panel holding the three frames the
-model was actually handed, at capture resolution.
+end-effector trails, and a 400 px, 15 FPS "Live cameras" panel fed by the same
+readers as the policy.
 
 The wire defaults match the reference deployment; the three flags that change
 how the chunk is *executed* are opt-in, because matching the reference there
@@ -272,7 +272,6 @@ uv run openpi-control rollout \
     --root ~/openpi-data/rollouts/fold-towel \
     --episodes 3 --episode-seconds 120 \
     --server http://192.168.0.107:4090 \
-    --interface left=can_left --interface right=can_right \
     --speed 0.5 --port 8080
 ```
 
@@ -304,16 +303,16 @@ uv run openpi-control live --rig yam_bimanual
 
 ```
 live: rig yam_bimanual — two YAM followers, each with an E_Yam gripper
-  left     Yam    can0     E_Yam    follower
-  right    Yam    can1     E_Yam    follower
+  left     Yam    can_left     E_Yam    follower
+  right    Yam    can_right    E_Yam    follower
 
 preflight left: all checks pass
 preflight right: all checks pass
 
-  left     Yam on can0 — energized, holding
-  right    Yam on can1 — energized, holding
+  left     Yam on can_left — energized, holding
+  right    Yam on can_right — energized, holding
   cameras  top, left_wrist, right_wrist — live in the browser
-  viser    http://localhost:8080
+  viser    http://<robot-box-ip>:8080
 ctrl-c to park at home_pos and power down
 ```
 
@@ -386,7 +385,7 @@ holding.
 ### Cameras in the browser
 
 Tiles are previews, and priced like previews: each frame is subsampled to 400 px
-wide and pushed at 10 Hz, not the 30 Hz the poses go out at. Three 848x480
+wide and pushed at 15 Hz, not the 30 Hz the poses go out at. Three 848x480
 streams pushed whole on the mirror clock would be ~35 MB/s of websocket to
 answer a question a thumbnail answers just as well. They ride the same clock as
 the poses rather than a thread of their own, so images and poses share one
@@ -421,10 +420,10 @@ uv run openpi-control live --rig yam_bimanual --control
 ```
 
 ```
-  left     Yam on can0 — energized, holding
-  right    Yam on can1 — energized, holding
+  left     Yam on can_left — energized, holding
+  right    Yam on can_right — energized, holding
   control  left, right — disarmed; arm each one in the browser
-  viser    http://localhost:8080
+  viser    http://<robot-box-ip>:8080
 ```
 
 Sliders and a live hardware feed fight over the pose only if you let them both

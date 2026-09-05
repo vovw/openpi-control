@@ -42,6 +42,7 @@ GUI sliders drive the joints.
 from __future__ import annotations
 
 import argparse
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,15 +80,46 @@ _AXIS_MARKER_COLOR = (250, 165, 40)
 # "is the light any good" -- it is not a recording, so it wants to be legible
 # and cheap rather than faithful. Three 848x480 streams pushed whole at the
 # 30 Hz mirror rate is ~35 MB/s of websocket for a question a 400px thumbnail
-# at 10 Hz answers just as well.
+# at 15 Hz answers just as well. JPEG is intentional here even when inference
+# uses raw frames: raw is the policy wire contract, while a browser preview is
+# a separate bandwidth budget.
 _PREVIEW_MAX_WIDTH = 400
-_PREVIEW_RATE_HZ = 10.0
+_PREVIEW_RATE_HZ = 15.0
 _PREVIEW_JPEG_QUALITY = 70
 
 # What a preview tile shows before its camera's first frame lands, so the panel
 # has its final layout from the moment the page opens rather than growing a
 # tile per camera over the first second.
 _PREVIEW_PLACEHOLDER = (32, 34, 38)
+
+
+def _local_ipv4_address() -> str:
+    """Best LAN address for a browser opening a server on this machine.
+
+    A UDP ``connect`` chooses a route without sending a packet, so this works
+    offline and avoids the common ``hostname`` -> ``127.0.1.1`` result. The
+    documentation-only TEST-NET address is merely a route-selection target.
+    Loopback is the honest fallback on a machine with no configured route.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))
+            address = str(probe.getsockname()[0])
+            if address and address != "0.0.0.0":
+                return address
+    except OSError:
+        pass
+
+    try:
+        for result in socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM
+        ):
+            address = str(result[4][0])
+            if address and not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+    return "127.0.0.1"
 
 
 # Per-arm tints, so the arms of a bimanual scene stay tellable apart. Blue and
@@ -266,7 +298,11 @@ class ArmVisualizer:
         self._positions = np.array([spec.rest for spec in self._joints], dtype=np.float64)
 
         own_server = server is None
-        self.server = server if server is not None else self._mods.viser.ViserServer(port=port)
+        self.server = (
+            server
+            if server is not None
+            else self._mods.viser.ViserServer(host=_local_ipv4_address(), port=port)
+        )
         if own_server:
             configure_page_theme(self.server)
         self._root = root_node_name or f"/{self.name}"
@@ -466,7 +502,7 @@ class ArmVisualizer:
 
     @property
     def url(self) -> str:
-        return f"http://localhost:{self.server.get_port()}"
+        return f"http://{_local_ipv4_address()}:{self.server.get_port()}"
 
     def update(self, positions: Sequence[float] | Mapping[str, float] | np.ndarray) -> None:
         """Render a joint pose given in radians.
@@ -687,7 +723,11 @@ class ArmSceneVisualizer:
         self.label = label
         mods = import_viz_modules()
         own_server = server is None
-        self.server = server if server is not None else mods.viser.ViserServer(port=port)
+        self.server = (
+            server
+            if server is not None
+            else mods.viser.ViserServer(host=_local_ipv4_address(), port=port)
+        )
         if own_server:
             configure_page_theme(self.server)
         self._trimesh = mods.trimesh
@@ -813,7 +853,7 @@ class ArmSceneVisualizer:
 
     @property
     def url(self) -> str:
-        return f"http://localhost:{self.server.get_port()}"
+        return f"http://{_local_ipv4_address()}:{self.server.get_port()}"
 
     def __getitem__(self, name: str) -> ArmVisualizer:
         try:

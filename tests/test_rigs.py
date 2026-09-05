@@ -38,11 +38,11 @@ def test_unknown_rig_names_the_ones_that_exist() -> None:
         resolve_rig("yam_trimanual")
 
 
-def test_yam_bimanual_is_two_followers_on_adjacent_can_buses() -> None:
+def test_yam_bimanual_is_two_followers_on_persistent_can_aliases() -> None:
     rig = resolve_rig("yam_bimanual")
 
     assert rig.names == ("left", "right")
-    assert [arm.interface for arm in rig.arms] == ["can0", "can1"]
+    assert [arm.interface for arm in rig.arms] == ["can_left", "can_right"]
     assert {arm.effector_model for arm in rig.arms} == {"E_Yam"}
     assert len(rig.followers) == 2
     assert rig.leaders == ()
@@ -81,9 +81,12 @@ def test_rig_rejects_an_unknown_role_and_duplicate_arm_names() -> None:
 def test_interface_overrides_move_one_arm_and_leave_the_other() -> None:
     rig = resolve_rig("yam_bimanual").with_interfaces({"right": "can5"})
 
-    assert [arm.interface for arm in rig.arms] == ["can0", "can5"]
+    assert [arm.interface for arm in rig.arms] == ["can_left", "can5"]
     # The original is untouched: rigs are frozen, overrides return a copy.
-    assert [arm.interface for arm in resolve_rig("yam_bimanual").arms] == ["can0", "can1"]
+    assert [arm.interface for arm in resolve_rig("yam_bimanual").arms] == [
+        "can_left",
+        "can_right",
+    ]
 
 
 def test_an_override_for_an_arm_that_is_not_in_the_rig_is_an_error() -> None:
@@ -106,7 +109,7 @@ def test_subset_keeps_rig_order_and_rejects_unknown_names() -> None:
 def test_rig_lookup_by_name_reports_what_it_holds() -> None:
     rig = resolve_rig("yam_bimanual")
 
-    assert rig["left"].interface == "can0"
+    assert rig["left"].interface == "can_left"
     with pytest.raises(ConfigurationError, match="left, right"):
         rig["middle"]
 

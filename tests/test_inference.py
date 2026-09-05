@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import threading
 import time
 from types import SimpleNamespace
@@ -224,7 +225,7 @@ def test_http_client_posts_json_numpy_payload(monkeypatch) -> None:
     actions = client.infer(_observation(), "pick up the object")
 
     assert actions.shape == (2, 14)
-    assert session.gets[0][0] == "http://127.0.0.1:8202/act"
+    assert session.gets[0][0] == "http://127.0.0.1:8202/healthz"
     url, body, headers = session.posts[0]
     assert url == "http://127.0.0.1:8202/act"
     assert headers["Content-Type"] == "application/json"
@@ -247,6 +248,137 @@ def test_health_rejects_a_server_with_another_contract(monkeypatch) -> None:
     client = inference.MolmoActClient(session=session)
     with pytest.raises(inference.InferenceError, match="state_dim"):
         client.health()
+
+
+# The health payload of the pi05 serve_unified.py this cell runs, trimmed to
+# the fields the client reads. It routes /act to POST only, so the legacy
+# GET /act probe answers 405 and the dedicated route is the only one that works.
+UNIFIED_HEALTH = (
+    '{"status":"ok","backend":"pi05","action_horizon":30,"action_dim":14,'
+    '"state_dim":14,"camera_order":["top","left","right"]}'
+)
+
+
+def test_health_falls_through_to_the_legacy_probe_on_a_reference_server() -> None:
+    """A server with no /healthz is still healthy, and still wants array frames."""
+    session = _FakeSession(
+        _FakeResponse('{"detail":"Not Found"}', status_code=404),
+        _FakeResponse('{"detail":"Not Found"}', status_code=404),
+        _FakeResponse('{"status":"ok","norm_tag":"yam_dual_molmoact2","state_dim":14}'),
+    )
+    client = inference.MolmoActClient("127.0.0.1:8202", session=session)
+    payload = client.health()
+
+    assert payload["norm_tag"] == inference.MOLMOACT_NORM_TAG
+    assert [url for url, _ in session.gets] == [
+        "http://127.0.0.1:8202/healthz",
+        "http://127.0.0.1:8202/health",
+        "http://127.0.0.1:8202/act",
+    ]
+    assert client.frame_encoding == inference.FRAME_ENCODING_ARRAY
+
+
+def test_health_switches_a_unified_server_to_base64_frames() -> None:
+    """The 405 that used to read as 'not ready' is a route that is POST-only."""
+    session = _FakeSession(_FakeResponse(UNIFIED_HEALTH))
+    client = inference.MolmoActClient("192.168.0.107:8203", session=session)
+    payload = client.health()
+
+    assert session.gets[0][0] == "http://192.168.0.107:8203/healthz"
+    assert payload["backend"] == "pi05"
+    assert client.last_health == payload
+    assert client.frame_encoding == inference.FRAME_ENCODING_BASE64
+
+
+def test_a_post_only_act_route_alone_is_not_a_healthy_server() -> None:
+    """Every candidate skipped means no health route, not a silent pass."""
+    session = _FakeSession(
+        _FakeResponse('{"detail":"Not Found"}', status_code=404),
+        _FakeResponse('{"detail":"Not Found"}', status_code=404),
+        _FakeResponse('{"detail":"Method Not Allowed"}', status_code=405),
+    )
+    client = inference.MolmoActClient("192.168.0.107:8203", session=session)
+    with pytest.raises(inference.InferenceError, match="no health route"):
+        client.health()
+
+
+def test_health_rejects_a_server_serving_the_wrong_camera_count() -> None:
+    session = _FakeSession(
+        _FakeResponse('{"status":"ok","state_dim":14,"camera_order":["top"]}')
+    )
+    client = inference.MolmoActClient(session=session)
+    with pytest.raises(inference.InferenceError, match="serves 1 cameras"):
+        client.health()
+
+
+def test_an_explicit_frame_encoding_survives_health() -> None:
+    """The operator keeps the last word against a server this table misreads."""
+    session = _FakeSession(_FakeResponse(UNIFIED_HEALTH))
+    client = inference.MolmoActClient(
+        "192.168.0.107:8203",
+        frame_encoding=inference.FRAME_ENCODING_ARRAY,
+        session=session,
+    )
+    client.health()
+    assert client.frame_encoding == inference.FRAME_ENCODING_ARRAY
+
+    with pytest.raises(ConfigurationError, match="frame encoding"):
+        inference.MolmoActClient(frame_encoding="protobuf")
+
+
+def test_base64_frames_are_the_same_picture_in_another_container() -> None:
+    pytest.importorskip("PIL")
+    frame = np.random.default_rng(0).integers(0, 255, (32, 48, 3)).astype(np.uint8)
+    as_array = inference.encode_frame(frame, jpeg_quality=95)
+    as_text = inference.encode_frame(
+        frame, jpeg_quality=95, encoding=inference.FRAME_ENCODING_BASE64
+    )
+
+    assert isinstance(as_text, str)
+    assert base64.b64decode(as_text) == as_array.tobytes()
+    np.testing.assert_array_equal(
+        inference.decode_wire_frame(as_text), inference.decode_wire_frame(as_array)
+    )
+    # A data URI is the other form the unified server accepts.
+    np.testing.assert_array_equal(
+        inference.decode_wire_frame("data:image/jpeg;base64," + as_text),
+        inference.decode_wire_frame(as_text),
+    )
+    with pytest.raises(inference.InferenceError, match="did not decode"):
+        inference.decode_wire_frame("not base64 at all!!")
+
+
+def test_a_negotiated_client_sends_string_frames(monkeypatch) -> None:
+    """What health settled is what the next /act request actually carries."""
+    pytest.importorskip("PIL")
+    payloads = []
+
+    class FakeJsonNumpy:
+        @staticmethod
+        def dumps(payload):
+            payloads.append(payload)
+            return "{}"
+
+        @staticmethod
+        def loads(_body):
+            return {"actions": np.zeros((30, 14), dtype=np.float32)}
+
+    monkeypatch.setattr(inference, "_json_numpy", lambda: FakeJsonNumpy)
+    session = _FakeSession(_FakeResponse(UNIFIED_HEALTH), _FakeResponse("{}"))
+    client = inference.MolmoActClient("192.168.0.107:8203", session=session)
+    client.health()
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    client.infer(
+        inference.BimanualObservation(
+            frame, frame, frame, np.zeros(14, dtype=np.float32)
+        ),
+        "fold the tshirt",
+    )
+
+    assert isinstance(payloads[-1]["top_cam"], str)
+    assert isinstance(payloads[-1]["right_cam"], str)
+    # The preview still resolves a string frame to a picture.
+    assert inference.served_frames(client)["top"].shape == frame.shape
 
 
 def test_frames_go_out_jpeg_encoded_by_default(monkeypatch) -> None:
@@ -273,9 +405,19 @@ CURRENT_SERVER_ERROR = (
 )
 
 
+# Verbatim from serve_unified.py, which takes an encoded frame only as base64.
+UNIFIED_SERVER_ERROR = (
+    '{"error": "Could not interpret image of shape (139363,) as HxWx3 RGB '
+    "(normalised to (139363,)). Send HxWx3 / HxW / CxHxW uint8, a PNG/JPEG as "
+    'base64, or a PIL image."}'
+)
+
+
 def test_only_a_raw_only_server_reads_as_unable_to_decode_jpeg() -> None:
     assert inference.server_rejects_encoded_frames(RAW_ONLY_SERVER_ERROR)
     assert not inference.server_rejects_encoded_frames(CURRENT_SERVER_ERROR)
+    # It wants the other encoded container, not raw frames.
+    assert not inference.server_rejects_encoded_frames(UNIFIED_SERVER_ERROR)
     # A corrupt JPEG is Pillow's complaint, not a contract mismatch.
     assert not inference.server_rejects_encoded_frames(
         '{"error": "inference failed: cannot identify image file"}'
@@ -478,6 +620,94 @@ def test_run_infer_commands_and_parks_with_fake_hardware(monkeypatch) -> None:
     assert all(backend.closes[0] is True for backend in made.values())
     assert all(not backend.connected for backend in made.values())
     assert policy.closed
+
+
+def test_run_infer_steps_a_lightweight_live_camera_preview(monkeypatch) -> None:
+    from openpi_control import viz
+
+    class FakePolicy:
+        url = "http://policy/act"
+        last_latency: dict[str, float] = {}
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def health(self):
+            return {"status": "ok"}
+
+        def infer(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return np.zeros((2, 14), dtype=np.float64)
+            raise inference.InferenceError("test stop")
+
+        def close(self) -> None:
+            pass
+
+    class FakeScene:
+        server = SimpleNamespace(stop=lambda: None)
+        url = "http://192.168.0.42:8080"
+        arm = SimpleNamespace(
+            joint_specs=tuple(SimpleNamespace(lower=-3.0, upper=3.0) for _ in range(6))
+        )
+
+        @classmethod
+        def from_rig(cls, *_args, **_kwargs):
+            return cls()
+
+        def __getitem__(self, _name):
+            return self.arm
+
+        def update(self, *_args) -> None:
+            pass
+
+        def update_chunk(self, *_args) -> None:
+            pass
+
+        def set_chunk_progress(self, *_args) -> None:
+            pass
+
+        def clear_chunk(self) -> None:
+            pass
+
+    preview: dict[str, object] = {"steps": []}
+
+    class FakeCameraPanel:
+        def __init__(self, _server, _readers, **kwargs) -> None:
+            preview["kwargs"] = kwargs
+
+        def step(self, dt: float) -> None:
+            preview["steps"].append(dt)  # type: ignore[union-attr]
+
+    class FakeGripperPanel:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def update(self, *_args, **_kwargs) -> None:
+            pass
+
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    readers = {
+        name: SimpleNamespace(latest=lambda frame=frame: frame, pixel_format="rgb8")
+        for name in ("top", "left_wrist", "right_wrist")
+    }
+    monkeypatch.setattr(cli, "open_inference_cameras", lambda *_args, **_kwargs: readers)
+    monkeypatch.setattr(viz, "ArmSceneVisualizer", FakeScene)
+    monkeypatch.setattr(viz, "CameraPanel", FakeCameraPanel)
+    monkeypatch.setattr(viz, "GripperPanel", FakeGripperPanel)
+
+    cli.run_infer(
+        resolve_rig("yam_bimanual"),
+        instruction="test task",
+        visualize=True,
+        prefetch=False,
+        control_rate_hz=1000.0,
+        backend_factory=lambda _rig_arm: FakeArmBackend(),
+        policy=FakePolicy(),
+    )
+
+    assert preview["kwargs"] == {"folder": "Live cameras"}
+    assert preview["steps"]
 
 
 def test_speed_spends_more_ticks_on_the_same_chunk(monkeypatch) -> None:

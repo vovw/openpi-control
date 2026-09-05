@@ -25,6 +25,7 @@ dependencies = [
   # USB-serial bus-servo maintenance sessions (openpi_control.servos.buses)
   # for the FeeTech/Dynamixel serial families (e.g. SO-ARM101).
   "pyserial>=3.5",
+  "rich>=13",
 ]
 
 [project.optional-dependencies]

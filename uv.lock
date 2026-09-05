@@ -1686,6 +1686,7 @@ dependencies = [
     { name = "pyserial" },
     { name = "python-can" },
     { name = "pyzmq" },
+    { name = "rich" },
     { name = "trossen-arm" },
 ]
 
@@ -1743,6 +1744,7 @@ requires-dist = [
     { name = "python-can", specifier = ">=4.3" },
     { name = "pyzmq", specifier = ">=25" },
     { name = "requests", marker = "extra == 'inference'", specifier = ">=2.31" },
+    { name = "rich", specifier = ">=13" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "trossen-arm", specifier = "==1.10.0" },
     { name = "viser", marker = "extra == 'viz'", specifier = ">=1.0" },

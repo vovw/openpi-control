@@ -50,6 +50,19 @@ GPU.
 
 ## Runtime behavior
 
+In an interactive POSIX terminal, `infer` uses a compact Rich display with the
+command, instruction, server, and speed pinned above colored recent logs. Press
+`q` to request a graceful stop and the usual parking sequence; an in-flight
+server request may need to finish or time out first. Ctrl-C remains available.
+Use `--plain` to disable the display. Redirected output automatically stays plain.
+The display keeps the latest 500 lines in memory; printed output and Python logs
+are also written to the runtime log. The final few lines remain visible on exit.
+Unreachable servers are retried five seconds after each failed startup connection
+attempt. Press `q` or Ctrl-C to cancel; the arms are not energized while waiting.
+Protocol errors and runtime failures remain in the display until `q` or Ctrl-C
+closes it. `--plain` and redirected runs also retry startup connections, but exit
+immediately on other failures. Runtime failures do not automatically restart motion.
+
 The command requires the packaged `yam_bimanual` rig: left and right YAM
 followers plus the `top`, `left_wrist`, and `right_wrist` cameras. Observations
 are sent in the checkpoint's order:
@@ -106,20 +119,14 @@ The scene includes the calibrated top-camera frame from the bimanual midpoint
 calibration; that is visualization metadata only, and wrist-camera poses stay
 absent until calibrated.
 
-### The "Policy input" panel
+### The "Live cameras" panel
 
-The camera tiles on the `infer` page are not a live preview. They are the three
-frames the policy was handed, decoded back from the wire, at capture resolution
-(848x480 on this cell) — so what is on the page is the model's own picture,
-compression artifacts included, not a picture taken beside it. They update once
-per inference rather than on a preview clock, which is why they hold still
-between chunks: that is one observation, held for as long as the policy is
-acting on it.
-
-Measured on this cell at q95, the wire form is 11-12x smaller than the raw
-frame with a mean per-pixel difference of ~1.3/255, so the tiles are
-effectively what the camera saw. With `--raw-frames` the tiles are served
-lossless, because the policy's input is then lossless too.
+The camera tiles on the `infer` page are a 400 px, 15 FPS preview sourced from
+the same already-open readers that supply the policy. They are JPEG-compressed
+for Viser independently of the inference transport: `--raw-frames` still sends
+raw capture arrays to MolmoAct, without making the browser websocket carry raw
+848x480 frames. This keeps the operator view responsive without adding another
+camera consumer or a decode/re-encode pass through the policy payload.
 
 For reference, the reference deployment's own comments describe 360x640 frames,
 so this cell feeds the model ~1.8x the pixels it does. The processor resizes
@@ -141,8 +148,6 @@ uv run openpi-control rollout \
     --episodes 3 \
     --episode-seconds 120 \
     --server http://192.168.0.107:4090 \
-    --interface left=can_left \
-    --interface right=can_right \
     --speed 0.5 \
     --port 8080
 ```
@@ -182,11 +187,10 @@ Useful rollout controls:
 | `--no-reset-pause` | do not wait for the manual towel reset between attempts |
 | `--interface ARM=IFACE` | map the packaged rig to this cell's CAN names |
 
-For this cell the persistent SocketCAN names are `can_left` and `can_right`,
-so keep the two `--interface` overrides unless the packaged rig defaults have
-been changed locally. Open Viser at `http://<robot-box>:8080` while the rollout
-is running; the page shows measured arms, the current predicted chunk, and the
-policy-input camera frames.
+The packaged rig uses this cell's persistent SocketCAN names, `can_left` and
+`can_right`. Use `--interface` overrides only on cells whose aliases differ.
+Open Viser at `http://<robot-box>:8080` while the rollout is running; the page
+shows measured arms, the current predicted chunk, and the live camera previews.
 
 Each chunk logs its size, the round trip split into GPU and transport time, the
 payload size, how many actions the safety clamp has filed down, how far behind

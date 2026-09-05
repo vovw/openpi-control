@@ -46,7 +46,8 @@ uv run openpi-control-viz --model Yam --effector E_Yam    # one arm
 uv run openpi-control-viz --list                          # models with a URDF
 ```
 
-Then open <http://localhost:8080>.
+Then open the LAN IP URL printed by the command, for example
+`http://192.168.0.42:8080`.
 
 | Flag | Meaning |
 | --- | --- |

@@ -598,8 +598,8 @@ def test_live_list_describes_the_rig_without_energizing_anything(capsys) -> None
     assert cli.main(["live", "--list"]) == 0
     out = capsys.readouterr().out
     assert "yam_bimanual" in out
-    assert "left" in out and "can0" in out
-    assert "right" in out and "can1" in out
+    assert "left" in out and "can_left" in out
+    assert "right" in out and "can_right" in out
 
 
 def test_live_refuses_to_energize_when_preflight_fails(capsys) -> None:
@@ -621,8 +621,8 @@ def test_preflight_rig_checks_every_arm() -> None:
 def test_doctor_rig_checks_both_arms_of_the_rig(capsys) -> None:
     cli.main(["doctor", "--rig", "yam_bimanual"])
     out = capsys.readouterr().out
-    assert "left (Yam on can0)" in out
-    assert "right (Yam on can1)" in out
+    assert "left (Yam on can_left)" in out
+    assert "right (Yam on can_right)" in out
     assert "2 arms" in out
 
 

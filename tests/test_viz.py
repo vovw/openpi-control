@@ -445,6 +445,25 @@ def test_live_drives_the_rig_scene_from_the_arms(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def test_lan_address_comes_from_the_selected_ipv4_route(monkeypatch) -> None:
+    class _Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def connect(self, target) -> None:
+            assert target == ("192.0.2.1", 9)
+
+        def getsockname(self):
+            return ("192.168.0.42", 51000)
+
+    monkeypatch.setattr(viz.socket, "socket", lambda *_args: _Probe())
+
+    assert viz._local_ipv4_address() == "192.168.0.42"
+
+
 class _FakeReader:
     """A CameraReader's preview surface: a spec, a frame count, and latest().
 

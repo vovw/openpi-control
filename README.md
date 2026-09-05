@@ -74,6 +74,48 @@ uv sync --extra lerobot   # adds to the default set, replaces nothing
 
 ## Operator CLI
 
+### VR simulation in Viser
+
+The standard VR workflow (keep `vr-teleop-relay` running in the kit environment):
+
+```bash
+uv run openpi-control adb connect --open
+uv run openpi-control health vr
+uv run openpi-control teleop
+```
+
+`teleop` now defaults to **real hardware**. It discovers `~/vr-teleop-kit` (or the
+`external/vr-teleop-kit` checkout), waits for headset poses before powering arms,
+and mirrors measured joints in Viser. `--only left` selects one arm. `q`, Ctrl-C,
+or Viser's Stop button parks and powers down. Use `--no-viz` to omit Viser.
+
+For recording, use `teleop --record --task "fold the cloth"`: a unique dataset
+name is generated unless `--repo-id` is supplied. This uses the existing 30 FPS
+recording loop with cameras by default (`--no-cameras` records only state/actions).
+Right B starts an episode and left Y saves it. The recording path currently has
+no Viser mirror; its existing startup checks differ from standalone teleop.
+`adb connect` configures USB forwarding; it does not start the relay. Re-run it
+after reconnecting the USB cable.
+
+With `vr-teleop-kit` installed or checked out at `~/vr-teleop-kit`, start its
+`vr-teleop-relay`, then run:
+
+```bash
+.venv/bin/openpi-control teleop --backend sim --port 8080
+```
+
+Use `--vr-kit PATH` for another checkout, `--vr-url ws://HOST:8443/ws` for another
+relay, or `--yam-xml PATH` to supply the YAM MJCF. For a USB-connected Quest,
+run `adb reverse tcp:8443 tcp:8443` and open `http://localhost:8443/` in its browser.
+Start teleop on the headset page and hold a controller grip to move its arm.
+Open the Viser URL printed by the command to see both arms. Stop with Ctrl-C or
+Viser's **Stop simulation** button.
+
+This is a kinematic IK twin: no hardware session, CAN connection, camera capture,
+or contact physics. The fixed URDF fingers do not animate; the gripper panel shows
+their simulated normalized positions. The relay's optional camera streams are
+configured separately. The IK rate defaults to 100 Hz; Viser updates at up to 30 Hz.
+
 `openpi-control` preflights an arm, sets its servo zeros, and brings a rig up
 and back down. Every run logs to `~/openpi-data/logs/runtime/`.
 
@@ -95,7 +137,7 @@ current pose as each servo's firmware zero, so it confirms first. See
 A rig names a whole cell — which arms it has, the bus each sits on, and where
 their bases sit relative to each other — so the CLI and the visualizer mean the
 same thing by `left`. `yam_bimanual` is two YAM followers with `E_Yam` grippers,
-left on `can0` and right on `can1`.
+left on `can_left` and right on `can_right`.
 
 `openpi-control live` is the one command here that energizes an arm, and it owns
 the whole arc:
@@ -154,8 +196,6 @@ uv run openpi-control rollout \
     --episodes 3 \
     --episode-seconds 120 \
     --server http://192.168.0.107:4090 \
-    --interface left=can_left \
-    --interface right=can_right \
     --speed 0.5 \
     --port 8080
 ```
@@ -224,7 +264,7 @@ runs with the hardware down or absent.
 ```bash
 uv sync
 uv run openpi-control-viz --fetch-meshes --model Yam     # once, needs network
-uv run openpi-control-viz --model Yam --effector E_Yam   # http://localhost:8080
+uv run openpi-control-viz --model Yam --effector E_Yam   # prints the robot-box IP URL
 ```
 
 The wheel ships each URDF but not its meshes — the URDFs are here for the

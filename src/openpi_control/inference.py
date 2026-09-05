@@ -18,6 +18,7 @@ the policy is asked to do.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import threading
@@ -38,6 +39,31 @@ MOLMOACT_GRIPPER_DOF = 1
 MOLMOACT_CAMERA_NAMES = ("top", "left_wrist", "right_wrist")
 MOLMOACT_ARM_NAMES = ("left", "right")
 DEFAULT_MOLMOACT_SERVER = "http://127.0.0.1:8202/act"
+
+# Health routes, tried in this order before the legacy ``GET /act`` probe.
+# ``serve_unified.py`` routes /act to POST only, so the legacy probe comes back
+# "405 Method Not Allowed" there and reads as a server that is up but sick --
+# which is what an operator pointed at a unified server sees today.
+HEALTH_PATHS = ("/healthz", "/health")
+
+# How an encoded frame rides the payload, because the two server generations
+# disagree. ``json_numpy`` base64s an ndarray, so host_server_yam.py reads a
+# 1-D uint8 array as JPEG bytes; serve_unified.py instead reads a base64
+# *string* and answers an array with an opaque HTTP 500 ("Inference failed --
+# see server logs"), which says nothing about the frame format being the
+# problem. Measured against the pi05 unified server on this cell with three
+# 360x640 views, the base64 JPEG payload is 1.09 MB against 2.77 MB raw and
+# spends 0.016 s on the wire against 0.039 s -- on noise frames, which is the
+# worst case for JPEG, so a real scene gains more. Either way the round trip
+# is dominated by the ~0.07-0.15 s the GPU spends, which is why this is a
+# compatibility choice first and a bandwidth one second.
+FRAME_ENCODING_ARRAY = "array"
+FRAME_ENCODING_BASE64 = "base64"
+FRAME_ENCODINGS = (FRAME_ENCODING_ARRAY, FRAME_ENCODING_BASE64)
+
+# Health-payload keys only serve_unified.py sends. Either one identifies the
+# generation that wants base64-string frames.
+UNIFIED_HEALTH_KEYS = ("backend", "camera_order")
 
 # The server's own normalization statistics key. Sent for wire fidelity with
 # the reference client and, more usefully, checked against the health payload:
@@ -145,6 +171,10 @@ class InferenceError(PiControlError):
     """The policy server or its response could not be used safely."""
 
 
+class InferenceConnectionError(InferenceError):
+    """The server could not be reached; startup may retry this failure."""
+
+
 class EncodedFramesUnsupported(InferenceError):
     """The server decodes raw HxWx3 frames only, not JPEG-encoded ones.
 
@@ -170,6 +200,16 @@ class EncodedFramesUnsupported(InferenceError):
 # operator at the wrong box.
 _RAW_FRAME_COMPLAINT = "HxWx3"
 _ENCODED_FRAME_CLAUSE = "1-D uint8"
+# serve_unified.py rejects the array form with a third message, which also
+# contains "HxWx3" and advertises the encoded form it *does* take:
+#
+#   Could not interpret image of shape (139363,) as HxWx3 RGB (...). Send
+#   HxWx3 / HxW / CxHxW uint8, a PNG/JPEG as base64, or a PIL image.
+#
+# That is not a server which needs raw frames -- it needs the other encoded
+# container, which :meth:`MolmoActClient.health` has already negotiated. Left
+# to the raw-only branch it would cost the run 2.5x the payload for nothing.
+_BASE64_FRAME_CLAUSE = "base64"
 
 
 def server_rejects_encoded_frames(response_body: str) -> bool:
@@ -179,8 +219,13 @@ def server_rejects_encoded_frames(response_body: str) -> bool:
     wrong "unsupported" silently halves the run's throughput for the rest of
     the episode and blames the server, while a wrong "supported" surfaces the
     server's own message, which says what is actually wrong with the frame.
+    A complaint that names an encoded form it accepts -- either generation's --
+    is therefore never read as a server that cannot decode one.
     """
-    return _RAW_FRAME_COMPLAINT in response_body and _ENCODED_FRAME_CLAUSE not in response_body
+    if _RAW_FRAME_COMPLAINT not in response_body:
+        return False
+    advertised = (_ENCODED_FRAME_CLAUSE, _BASE64_FRAME_CLAUSE)
+    return not any(clause in response_body for clause in advertised)
 
 
 def normalize_server_url(server: str | None) -> str:
@@ -193,6 +238,17 @@ def normalize_server_url(server: str | None) -> str:
     if not value.endswith("/act"):
         value += "/act"
     return value
+
+
+def health_urls(act_url: str) -> tuple[str, ...]:
+    """The health routes to try, in order, for one ``/act`` URL.
+
+    The dedicated routes come first and the legacy ``GET /act`` probe stays
+    last, so a unified server answers on the first try and a reference server
+    costs two cheap 404s before the probe that works.
+    """
+    base = act_url[: -len("/act")] if act_url.endswith("/act") else act_url
+    return tuple(base + path for path in HEALTH_PATHS) + (act_url,)
 
 
 def _json_numpy() -> Any:
@@ -246,12 +302,17 @@ def _as_rgb(frame: np.ndarray, *, pixel_format: str = "rgb8") -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
-def encode_frame(frame: np.ndarray, *, jpeg_quality: int) -> np.ndarray:
+def encode_frame(
+    frame: np.ndarray, *, jpeg_quality: int, encoding: str = FRAME_ENCODING_ARRAY
+) -> np.ndarray | str:
     """Return one frame in wire form: JPEG bytes, or the raw array at quality 0.
 
     ``json_numpy`` base64s any ndarray, so a 1-D uint8 array of JPEG bytes
     rides the existing payload with no new keys and no format negotiation --
-    the server treats 1-D uint8 as an encoded image and HxWx3 as a raw frame.
+    the reference server treats 1-D uint8 as an encoded image and HxWx3 as a
+    raw frame. ``encoding=FRAME_ENCODING_BASE64`` sends the same JPEG as a
+    base64 string instead, which is the form serve_unified.py decodes; the
+    picture is identical either way, only its container differs.
 
     The frame is validated and cast exactly the way the server's ``_to_pil``
     treats a raw one, so the transport is not also a change of picture. Pillow
@@ -266,12 +327,19 @@ def encode_frame(frame: np.ndarray, *, jpeg_quality: int) -> np.ndarray:
         image = np.clip(image, 0, 255).astype(np.uint8)
     if jpeg_quality <= 0:
         return image
+    if encoding not in FRAME_ENCODINGS:
+        raise ConfigurationError(
+            f"frame encoding must be one of {FRAME_ENCODINGS}, got {encoding!r}"
+        )
     buffer = io.BytesIO()
     _pil_image().fromarray(image, mode="RGB").save(buffer, format="JPEG", quality=jpeg_quality)
-    return np.frombuffer(buffer.getvalue(), dtype=np.uint8)
+    jpeg = buffer.getvalue()
+    if encoding == FRAME_ENCODING_BASE64:
+        return base64.b64encode(jpeg).decode("ascii")
+    return np.frombuffer(jpeg, dtype=np.uint8)
 
 
-def decode_wire_frame(frame: np.ndarray) -> np.ndarray:
+def decode_wire_frame(frame: np.ndarray | str) -> np.ndarray:
     """One wire frame as the server decodes it: RGB ``HxWx3`` uint8.
 
     The mirror of :func:`encode_frame`, and it exists so a preview can show the
@@ -279,6 +347,16 @@ def decode_wire_frame(frame: np.ndarray) -> np.ndarray:
     the pre-encoding original. A raw frame passes straight through, which is
     what the server's own decoder does with it too.
     """
+    if isinstance(frame, str):
+        # A base64-string frame, optionally as a data URI: both are forms the
+        # unified server accepts, so both have to come back as a picture.
+        payload = frame.split(",", 1)[1] if frame.startswith("data:") else frame
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except (ValueError, TypeError) as err:
+            raise InferenceError(f"a base64 wire frame did not decode: {err}") from err
+        image = _pil_image().open(io.BytesIO(decoded)).convert("RGB")
+        return np.asarray(image, dtype=np.uint8)
     array = np.asarray(frame)
     if array.ndim == 3:
         return array
@@ -326,6 +404,7 @@ class MolmoActClient:
         num_steps: int = DEFAULT_MOLMOACT_NUM_STEPS,
         jpeg_quality: int = DEFAULT_MOLMOACT_JPEG_QUALITY,
         enable_cuda_graph: bool = True,
+        frame_encoding: str | None = None,
         session: Any | None = None,
     ) -> None:
         if timeout_s <= 0:
@@ -345,12 +424,25 @@ class MolmoActClient:
         # Safe under a shared server because it serializes predict_action
         # behind a lock; graph capture is not concurrency-safe.
         self.enable_cuda_graph = bool(enable_cuda_graph)
+        # Which encoded-frame container this server understands. Left to
+        # :meth:`health` to settle from the server's own payload, because
+        # guessing it wrong costs an HTTP 500 that names no cause; passing one
+        # explicitly pins it, for a server that reports something new.
+        if frame_encoding is not None and frame_encoding not in FRAME_ENCODINGS:
+            raise ConfigurationError(
+                f"frame encoding must be one of {FRAME_ENCODINGS}, got {frame_encoding!r}"
+            )
+        self.frame_encoding = frame_encoding or FRAME_ENCODING_ARRAY
+        self._frame_encoding_pinned = frame_encoding is not None
+        # The last health payload, kept so the operator banner can name the
+        # checkpoint that actually answered.
+        self.last_health: dict[str, Any] = {}
         # Per-call latency, split the way the reference client reports it: the
         # GPU/transport split is the number that diagnoses a slow call.
         self.last_latency: dict[str, float] = {}
         # The frames exactly as they went out, kept so a preview can show what
         # the server was handed rather than a fresh read taken beside it.
-        self.last_wire_frames: dict[str, np.ndarray] = {}
+        self.last_wire_frames: dict[str, np.ndarray | str] = {}
         self._session = session
 
     @property
@@ -371,15 +463,39 @@ class MolmoActClient:
         """Check the server before any motors are energized.
 
         The payload is validated, not just the status: a bimanual-YAM server
-        and a DROID server both answer ``GET /act`` with ``{"status": "ok"}``
-        and differ only in the fields below, and finding that out from the
-        arms' behaviour is a worse way to find it out.
+        and a DROID server both answer with ``{"status": "ok"}`` and differ
+        only in the fields below, and finding that out from the arms'
+        behaviour is a worse way to find it out.
+
+        Answering also settles how frames go on the wire, since the generation
+        that owns the route that answered is the one that says which container
+        it can decode (see :data:`FRAME_ENCODING_ARRAY`).
         """
-        try:
-            response = self.session.get(self.url, timeout=self.timeout_s)
-        except (OSError, TimeoutError) as err:
-            raise InferenceError(f"cannot reach MolmoAct server {self.url}: {err}") from err
-        body = _response_text(response)
+        missing: list[str] = []
+        for url in health_urls(self.url):
+            try:
+                response = self.session.get(url, timeout=self.timeout_s)
+            except (OSError, TimeoutError) as err:
+                raise InferenceConnectionError(
+                    f"cannot reach MolmoAct server {url}: {err}"
+                ) from err
+            status = int(getattr(response, "status_code", 200))
+            # 404: this generation does not route it. 405: the route is there
+            # but POST-only, which is what GET /act answers on a unified
+            # server. Neither is a sick server, so try the next candidate.
+            if status in (404, 405):
+                missing.append(f"{url} HTTP {status}")
+                continue
+            payload = self._validated_health(url, _response_text(response))
+            self._adopt_frame_encoding(payload)
+            self.last_health = payload
+            return payload
+        raise InferenceError(
+            f"no health route answered on {self.url}: {', '.join(missing)}"
+        )
+
+    def _validated_health(self, url: str, body: str) -> dict[str, Any]:
+        """Parse one health body and check it against the bimanual contract."""
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as err:
@@ -389,15 +505,39 @@ class MolmoActClient:
         for key, expected in (
             ("norm_tag", MOLMOACT_NORM_TAG),
             ("state_dim", MOLMOACT_STATE_DIM),
+            ("action_dim", MOLMOACT_ACTION_DIM),
             ("num_cameras", len(MOLMOACT_CAMERA_NAMES)),
         ):
             actual = payload.get(key)
             if actual is not None and actual != expected:
                 raise InferenceError(
-                    f"MolmoAct server at {self.url} reports {key}={actual!r}, "
+                    f"MolmoAct server at {url} reports {key}={actual!r}, "
                     f"but the bimanual YAM contract needs {expected!r}"
                 )
+        # camera_order names the same three views, but in the server's own
+        # labels ("left" for what this package calls left_wrist), so only the
+        # count is comparable -- and the count is what a single-view or DROID
+        # checkpoint gets wrong.
+        order = payload.get("camera_order")
+        if isinstance(order, Sequence) and not isinstance(order, str):
+            if len(order) != len(MOLMOACT_CAMERA_NAMES):
+                raise InferenceError(
+                    f"MolmoAct server at {url} serves {len(order)} cameras "
+                    f"{list(order)!r}, but the bimanual YAM contract needs "
+                    f"{len(MOLMOACT_CAMERA_NAMES)}"
+                )
         return payload
+
+    def _adopt_frame_encoding(self, payload: Mapping[str, Any]) -> None:
+        """Adopt the encoded-frame container the answering server decodes.
+
+        Skipped when the constructor pinned one, so an operator keeps the last
+        word against a server that reports something this table has not seen.
+        """
+        if self._frame_encoding_pinned:
+            return
+        unified = any(key in payload for key in UNIFIED_HEALTH_KEYS)
+        self.frame_encoding = FRAME_ENCODING_BASE64 if unified else FRAME_ENCODING_ARRAY
 
     def infer(
         self,
@@ -416,10 +556,15 @@ class MolmoActClient:
         graph = self.enable_cuda_graph if enable_cuda_graph is None else bool(enable_cuda_graph)
         json_numpy = _json_numpy()
         quality = self.jpeg_quality
+        encoding = self.frame_encoding
         wire_frames = {
-            "top": encode_frame(observation.top_cam, jpeg_quality=quality),
-            "left_wrist": encode_frame(observation.left_cam, jpeg_quality=quality),
-            "right_wrist": encode_frame(observation.right_cam, jpeg_quality=quality),
+            "top": encode_frame(observation.top_cam, jpeg_quality=quality, encoding=encoding),
+            "left_wrist": encode_frame(
+                observation.left_cam, jpeg_quality=quality, encoding=encoding
+            ),
+            "right_wrist": encode_frame(
+                observation.right_cam, jpeg_quality=quality, encoding=encoding
+            ),
         }
         self.last_wire_frames = wire_frames
         payload = {

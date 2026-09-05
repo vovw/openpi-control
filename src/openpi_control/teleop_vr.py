@@ -50,6 +50,7 @@ them.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .exceptions import ConfigurationError
@@ -63,7 +64,6 @@ from .record import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
     from .types import ArmState
 
@@ -78,6 +78,20 @@ VR_HANDS = ("left", "right")
 # Joints per arm in the teleoperator's action dict. A YAM has six; the gripper
 # is reported separately as `<hand>_gripper.pos`.
 VR_ARM_DOFS = 6
+
+
+def resolve_vr_paths(kit_path: Path | None, model_path: str | None):
+    if kit_path is None:
+        candidates = (
+            Path(__file__).resolve().parents[2] / "external/vr-teleop-kit",
+            Path.home() / "vr-teleop-kit",
+        )
+        kit_path = next((p for p in candidates if (p / "src").is_dir()), None)
+    if not model_path and kit_path:
+        candidate = kit_path / "i2rt/i2rt/robot_models/arm/yam/yam.xml"
+        if candidate.is_file():
+            model_path = str(candidate)
+    return kit_path, model_path
 
 
 class QuestTeleopSource:
@@ -114,6 +128,7 @@ class QuestTeleopSource:
             )
 
         self._ws_url = ws_url
+        kit_path, model_path = resolve_vr_paths(kit_path, model_path)
         if teleoperator is not None:
             self._teleop = teleoperator
         else:
@@ -131,6 +146,7 @@ class QuestTeleopSource:
             try:
                 self._teleop.connect()
             except Exception as err:
+                self._teleop.disconnect()
                 # The overwhelmingly common cause is that the relay is not
                 # running, and a bare timeout traceback does not say so.
                 raise ConfigurationError(
@@ -155,6 +171,8 @@ class QuestTeleopSource:
         command a move to the folded park pose.
         """
         observation: dict[str, float] = {}
+        if any(states.get(name) is None for name in self.arm_names):
+            return False
         for name in self.arm_names:
             state = states.get(name)
             if state is None:
@@ -167,9 +185,7 @@ class QuestTeleopSource:
                 # dataset convention, and this reading is native. Numerically
                 # the same flip, but naming the direction is the only thing
                 # keeping either call site readable.
-                observation[f"{name}_gripper.pos"] = to_dataset_gripper(
-                    state.effector.position
-                )
+                observation[f"{name}_gripper.pos"] = to_dataset_gripper(state.effector.position)
         if not observation:
             return False
         self._teleop.seed_qpos_from_obs(observation)
@@ -189,8 +205,7 @@ class QuestTeleopSource:
         for name in self.arm_names:
             try:
                 joints = tuple(
-                    float(action[f"{name}_joint_{index + 1}.pos"])
-                    for index in range(VR_ARM_DOFS)
+                    float(action[f"{name}_joint_{index + 1}.pos"]) for index in range(VR_ARM_DOFS)
                 )
             except KeyError as err:
                 # A partial action is a protocol change, not a transient: better

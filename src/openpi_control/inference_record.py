@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from .exceptions import ConfigurationError
 from .inference import (
     DEFAULT_CHUNK_SPEED,
     DEFAULT_MAX_EFFECTOR_STEP,
@@ -29,7 +30,6 @@ from .inference import (
     build_observation,
     time_scale,
 )
-from .exceptions import ConfigurationError
 from .record import ArmTarget, EpisodeEvent, TeleopSource, TeleopStep
 from .types import ArmState, PositionCommand
 

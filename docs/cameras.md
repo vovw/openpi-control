@@ -155,7 +155,7 @@ uv run openpi-control live --rig yam_bimanual --control
 uv run openpi-control live --no-cameras       # leave them free for a recorder
 ```
 
-A tile is a preview, not a recording: 400 px wide at 10 Hz, against the 30 Hz
+A tile is a preview, not a recording: 400 px wide at 15 Hz, against the 30 Hz
 the poses go out at. Pushing three 848x480 streams whole on the mirror clock
 would be ~35 MB/s of websocket to answer a question a thumbnail answers. A
 camera that is unplugged, or held by another process, is named on stdout and

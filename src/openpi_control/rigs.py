@@ -289,7 +289,7 @@ class Rig:
 
 
 def _yam_bimanual() -> Rig:
-    """Two YAM followers, each with its own gripper, on adjacent CAN buses.
+    """Two YAM followers, each with its own gripper, on persistent CAN aliases.
 
     +Y is the cell's left, matching the arms' own base frames, so the scene
     reads the way an operator standing behind the cell sees it.
@@ -306,14 +306,14 @@ def _yam_bimanual() -> Rig:
             RigArm(
                 name="left",
                 model="Yam",
-                interface="can0",
+                interface="can_left",
                 effector_model="E_Yam",
                 base_position=(0.0, half, 0.0),
             ),
             RigArm(
                 name="right",
                 model="Yam",
-                interface="can1",
+                interface="can_right",
                 effector_model="E_Yam",
                 base_position=(0.0, -half, 0.0),
             ),

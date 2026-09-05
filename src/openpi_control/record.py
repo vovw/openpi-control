@@ -34,6 +34,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
@@ -42,7 +43,6 @@ from .exceptions import ConfigurationError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
     from .rigs import Rig
     from .types import ArmState
@@ -614,6 +614,37 @@ def _arm_dof(arm: object) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def check_recording_destination(repo_id: str, root: Path | None = None) -> Path:
+    """Resolve LeRobot's destination and reject existing data before power-up."""
+    if root is None:
+        try:
+            from lerobot.utils.constants import HF_LEROBOT_HOME
+        except ImportError as err:
+            raise ConfigurationError(
+                "Recording needs LeRobot: install with uv sync --extra lerobot"
+            ) from err
+        root = HF_LEROBOT_HOME / repo_id
+    root = Path(root).expanduser()
+    if root.exists():
+        raise recording_destination_error(root)
+    return root
+
+
+def recording_destination_error(root: Path) -> ConfigurationError:
+    return ConfigurationError(
+        f"Dataset folder already exists: {root}\n"
+        "Existing recordings were preserved. Choose a new --repo-id or an unused --root.\n"
+        'Example: --repo-id "local/vr-teleop-$(date +%Y%m%d-%H%M%S)"'
+    )
+
+
+def _create_dataset(dataset_module, **kwargs):
+    try:
+        return dataset_module.LeRobotDataset.create(**kwargs)
+    except FileExistsError as err:
+        raise recording_destination_error(Path(err.filename or str(kwargs.get("root")))) from err
+
+
 class LeRobotSink:
     """An :class:`EpisodeSink` backed by a real ``LeRobotDataset``.
 
@@ -636,7 +667,8 @@ class LeRobotSink:
     ) -> None:
         dataset_module = _require_lerobot()
         self.repo_id = repo_id
-        self._dataset = dataset_module.LeRobotDataset.create(
+        self._dataset = _create_dataset(
+            dataset_module,
             repo_id=repo_id,
             fps=fps,
             root=root,

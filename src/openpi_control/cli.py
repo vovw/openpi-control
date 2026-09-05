@@ -79,12 +79,12 @@ from .inference import (
     ChunkPrefetcher,
     EncodedFramesUnsupported,
     GripperWatch,
+    InferenceConnectionError,
     InferenceError,
     MolmoActClient,
     ReachingChunkExecutor,
     build_observation,
     command_lag,
-    served_frames,
     split_chunk,
     start_pose_plan,
     time_scale,
@@ -94,7 +94,7 @@ from .rigs import Rig, RigArm, resolve_rig, rig_names
 from .servos import SERVO_ZERO_DRIVERS, buses
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from .arms import FollowerArm, LeaderArm
     from .backend import ArmBackend
@@ -306,9 +306,11 @@ def run_doctor(
     read_only = [entry for entry in plan if entry.read_only]
     detail = f"{len(plan)} servos, all models known"
     if read_only:
-        detail += f" ({len(read_only)} read-only: " + ", ".join(
-            f"joint {entry.joint_id}" for entry in read_only
-        ) + ")"
+        detail += (
+            f" ({len(read_only)} read-only: "
+            + ", ".join(f"joint {entry.joint_id}" for entry in read_only)
+            + ")"
+        )
     results.append(CheckResult(_OK, "servo registry", detail))
 
     try:
@@ -317,9 +319,7 @@ def run_doctor(
         results.append(CheckResult(_FAIL, "bus type", str(err)))
         return results
     if port_type is None:
-        results.append(
-            CheckResult(_WARN, "bus type", "every servo is read-only; nothing to zero")
-        )
+        results.append(CheckResult(_WARN, "bus type", "every servo is read-only; nothing to zero"))
         return results
     results.append(CheckResult(_OK, "bus type", port_type))
 
@@ -409,9 +409,7 @@ def _probe_bus(
     """Open the bus and listen. Reads only — never sends."""
     expected = tuple(entry.servo_id for entry in writable)
     try:
-        with buses.open_bus(
-            port_type, interface, baudrate=_catalog_baudrate(model_config)
-        ) as bus:
+        with buses.open_bus(port_type, interface, baudrate=_catalog_baudrate(model_config)) as bus:
             if port_type != buses.PORT_TYPE_CAN:
                 return CheckResult(_OK, "bus probe", f"{port_type} session opened")
             answered = buses.recv_from(bus, expected, _PROBE_WINDOW_S)
@@ -556,9 +554,7 @@ def probe_cameras(
     for camera in rig.cameras:
         found = discovery.matched.get(camera.name)
         if found is None:
-            results.append(
-                CheckResult(_WARN, f"probe {camera.name}", "no device; nothing to open")
-            )
+            results.append(CheckResult(_WARN, f"probe {camera.name}", "no device; nothing to open"))
             continue
         try:
             with cameras_mod.CameraReader(found.spec()) as reader:
@@ -581,12 +577,8 @@ def probe_cameras(
                 if newest is not None:
                     frame = newest
                 height, width = frame.shape[:2]
-                detail = (
-                    f"{width}x{height} {fourcc}, {measured:.0f} fps (asked {camera.fps})"
-                )
-                status = (
-                    _OK if measured >= camera.fps * _CAMERA_FPS_TOLERANCE else _WARN
-                )
+                detail = f"{width}x{height} {fourcc}, {measured:.0f} fps (asked {camera.fps})"
+                status = _OK if measured >= camera.fps * _CAMERA_FPS_TOLERANCE else _WARN
                 if snapshot_dir is not None:
                     path = snapshot_dir / f"{camera.name}.png"
                     cameras_mod.write_snapshot(path, frame)
@@ -937,9 +929,7 @@ def run_live(
         if control and scene is not None:
             from .viser_control import RigControlPanel
 
-            followers = {
-                entry.name: entry.arm for entry in live_arms if entry.rig_arm.is_follower
-            }
+            followers = {entry.name: entry.arm for entry in live_arms if entry.rig_arm.is_follower}
             panel = RigControlPanel(scene, followers, float_mode=float_mode)  # type: ignore[arg-type]
             print(f"  control  {', '.join(followers)} — disarmed; arm each one in the browser")
         if camera_readers and scene is not None:
@@ -1025,6 +1015,21 @@ def _inference_states(live_arms: list[LiveArm], *, max_age_s: float) -> dict[str
     return states
 
 
+def _wait_for_inference_server(client: MolmoActClient, stop: threading.Event) -> bool:
+    """Retry startup connectivity only, before any hardware is energized."""
+    attempt = 1
+    while not stop.is_set():
+        try:
+            client.health()
+            return not stop.is_set()
+        except InferenceConnectionError as err:
+            print(f"warning: {err}\nRetrying in 5 seconds (attempt {attempt + 1})…")
+            if stop.wait(5.0):
+                return False
+            attempt += 1
+    return False
+
+
 def run_infer(
     rig: Rig,
     *,
@@ -1098,7 +1103,17 @@ def run_infer(
         jpeg_quality=jpeg_quality,
         enable_cuda_graph=enable_cuda_graph,
     )
-    client.health()
+    try:
+        ready = _wait_for_inference_server(client, stop)
+    except KeyboardInterrupt:
+        client.close()
+        return 0
+    except Exception:
+        client.close()
+        raise
+    if not ready:
+        client.close()
+        return 0
 
     # RGB is part of the model contract. The existing live command keeps BGR
     # for its cheap browser preview; inference requests RGB from the SDK so it
@@ -1117,9 +1132,9 @@ def run_infer(
 
             scene = ArmSceneVisualizer.from_rig(rig, mesh_dir=mesh_dir, port=port)
         camera_readers = open_inference_cameras(capture_rig, overrides=camera_overrides)
-        session, live_arms = power_up(
-            rig, float_mode=False, backend_factory=backend_factory
-        )
+        if stop.is_set():
+            return 0
+        session, live_arms = power_up(rig, float_mode=False, backend_factory=backend_factory)
         arm_map = {entry.name: entry.arm for entry in live_arms}
         limits = {
             name: (
@@ -1161,14 +1176,20 @@ def run_infer(
             # numbers instead of implying it with a mesh that never changes.
             gripper_panel = GripperPanel(scene.server, ("left", "right"))
 
-            # The tiles are the policy's own input, decoded back off the wire
-            # and pushed once per inference -- not a preview taken beside it --
-            # so they are served at capture resolution and never on a clock.
-            camera_panel = CameraPanel(
-                scene.server, camera_readers, folder="Policy input", max_width=None
-            )
+            # This preview is independent of the policy transport. In
+            # particular, --raw-frames still sends raw capture arrays to the
+            # model while Viser gets small JPEG thumbnails on the control
+            # clock. Pulling from the existing readers also avoids decoding a
+            # policy JPEG only to encode it again for the browser.
+            camera_panel = CameraPanel(scene.server, camera_readers, folder="Live cameras")
             print(f"  viser    {scene.url}")
-        print(f"  inference {client.url} — {instruction}")
+        # The backend the health payload named, because one /act route serves
+        # several checkpoints and "which model answered" is the first thing to
+        # check when the arms do something the instruction did not ask for.
+        health = getattr(client, "last_health", {}) or {}
+        backend = health.get("backend") or health.get("policy_type")
+        served_by = f" [{backend}]" if backend else ""
+        print(f"  inference {client.url}{served_by} — {instruction}")
         # Said before anything moves, because the operator can see the jaws and
         # the number in the same glance. The Viser render cannot help here: the
         # packaged YAM URDF has six actuated joints and the gripper is baked
@@ -1206,9 +1227,14 @@ def run_infer(
             for row in rows:
                 if stop.is_set():
                     return
+                tick_start = time.monotonic()
                 for name, command in row.items():
                     arm_map[name].command(command)
-                stop.wait(SUB_STEP_PERIOD_S)
+                if camera_panel is not None:
+                    camera_panel.step(SUB_STEP_PERIOD_S)
+                remaining = SUB_STEP_PERIOD_S - (time.monotonic() - tick_start)
+                if remaining > 0:
+                    stop.wait(remaining)
 
         def request(observation: object) -> np.ndarray:
             if prefetcher is not None:
@@ -1228,9 +1254,7 @@ def run_infer(
                 if int(getattr(client, "jpeg_quality", 0)) <= 0:
                     raise
                 print(f"  frames   {err}", file=sys.stderr)
-                print(
-                    "  frames   sending raw frames for the rest of the run", file=sys.stderr
-                )
+                print("  frames   sending raw frames for the rest of the run", file=sys.stderr)
                 client.jpeg_quality = 0
                 if prefetcher is not None:
                     prefetcher.drop()
@@ -1257,8 +1281,6 @@ def run_infer(
             plan = time_scale(actions, speed)
             if scene is not None:
                 scene.update_chunk(split_chunk(actions))
-            if camera_panel is not None:
-                camera_panel.push(served_frames(client))
             latency = getattr(client, "last_latency", None) or {}
             reading = gripper.render()
             clamped_now = executor.clamped
@@ -1283,8 +1305,7 @@ def run_infer(
                 # was *not* refused the arms failed to reach. A low clamp count
                 # beside a large lag is hardware that cannot keep up with the
                 # plan, and no clamp setting fixes that -- `--speed` does.
-                f"lag {last_lag:.3f}"
-                + (f"  grip {reading}" if reading else ""),
+                f"lag {last_lag:.3f}" + (f"  grip {reading}" if reading else ""),
                 flush=True,
             )
             clamped_before = clamped_now
@@ -1342,14 +1363,14 @@ def run_infer(
                     # control tick, and a rebuild costs 61 ms against a 33 ms
                     # period at the default 30 Hz.
                     scene.set_chunk_progress(int(round((index + 1) * speed)))
+                if camera_panel is not None:
+                    camera_panel.step(period)
                 if prefetcher is not None and not prefetcher.busy:
                     # Fire once the motion still queued is shorter than the call
                     # takes, so the next chunk lands just as this one runs out.
                     queued_s = (len(plan) - index - 1) * period
                     if queued_s <= prefetcher.latency_s + prefetch_margin_s:
-                        prefetcher.submit(
-                            build_observation(arm_map, camera_readers), instruction
-                        )
+                        prefetcher.submit(build_observation(arm_map, camera_readers), instruction)
                 remaining = period - (time.monotonic() - tick_start)
                 if remaining > 0:
                     stop.wait(remaining)
@@ -1420,9 +1441,7 @@ def run_rollout(
     from . import record as record_mod
 
     if tuple(rig.names) != ("left", "right"):
-        raise ConfigurationError(
-            "policy rollouts require the packaged bimanual left/right YAM rig"
-        )
+        raise ConfigurationError("policy rollouts require the packaged bimanual left/right YAM rig")
     if episodes <= 0:
         raise ConfigurationError("--episodes must be positive")
     if episode_seconds <= 0:
@@ -1459,9 +1478,7 @@ def run_rollout(
         "repo_id": repo_id,
         "instruction_is_per_episode": True,
         "speed": speed,
-        "chunk_size": (
-            chunk_size if chunk_size is not None else MOLMOACT_ACTION_HORIZON
-        ),
+        "chunk_size": (chunk_size if chunk_size is not None else MOLMOACT_ACTION_HORIZON),
         "episode_seconds": episode_seconds,
         "fps": fps,
         "partial_episodes_saved_on_ctrl_c": True,
@@ -1472,9 +1489,7 @@ def run_rollout(
     try:
         cameras = open_inference_cameras(capture_rig, overrides=camera_overrides)
         shapes = record_mod.camera_shapes(cameras)
-        state_names = record_mod.arm_feature_names(
-            ["left", "right"], {"left": 6, "right": 6}
-        )
+        state_names = record_mod.arm_feature_names(["left", "right"], {"left": 6, "right": 6})
         features = record_mod.build_features(state_names, shapes)
         sink = record_mod.LeRobotSink(
             repo_id=repo_id,
@@ -1491,9 +1506,7 @@ def run_rollout(
             from .viz import ArmSceneVisualizer, CameraPanel
 
             scene = ArmSceneVisualizer.from_rig(rig, mesh_dir=mesh_dir, port=port)
-            camera_panel = CameraPanel(
-                scene.server, cameras, folder="Policy input", max_width=None
-            )
+            camera_panel = CameraPanel(scene.server, cameras, folder="Live cameras")
             print(f"  viser    {scene.url}")
 
         for episode_index in range(1, episodes + 1):
@@ -1507,7 +1520,7 @@ def run_rollout(
             session = None
             live_arms: list[LiveArm] = []
             source: InferenceRolloutSource | None = None
-            saved_before = getattr(sink, "num_episodes")
+            saved_before = sink.num_episodes
             episode_result = None
             park_failures = 0
             try:
@@ -1517,14 +1530,10 @@ def run_rollout(
                 arm_map = {entry.name: entry.arm for entry in live_arms}
                 limits = {
                     name: (
-                        np.array(
-                            [spec.lower for spec in scene[name].joint_specs], dtype=np.float64
-                        )
+                        np.array([spec.lower for spec in scene[name].joint_specs], dtype=np.float64)
                         if scene is not None
                         else np.full(6, -np.inf),
-                        np.array(
-                            [spec.upper for spec in scene[name].joint_specs], dtype=np.float64
-                        )
+                        np.array([spec.upper for spec in scene[name].joint_specs], dtype=np.float64)
                         if scene is not None
                         else np.full(6, np.inf),
                     )
@@ -1534,8 +1543,6 @@ def run_rollout(
                 def on_chunk(actions: np.ndarray) -> None:
                     if scene is not None:
                         scene.update_chunk(split_chunk(actions))
-                    if camera_panel is not None:
-                        camera_panel.push(served_frames(client))
 
                 def on_tick(
                     states: Mapping[str, object],
@@ -1546,6 +1553,8 @@ def run_rollout(
                         for name, state in states.items():
                             scene.update(name, state.joints.position_rad)  # type: ignore[union-attr]
                         scene.set_chunk_progress(consumed)
+                    if camera_panel is not None:
+                        camera_panel.step(1.0 / fps)
 
                 source = InferenceRolloutSource(
                     arms=arm_map,
@@ -1587,23 +1596,20 @@ def run_rollout(
 
             if park_failures:
                 print(
-                    f"  {park_failures} arm(s) failed to park; stopping before the "
-                    "next episode",
+                    f"  {park_failures} arm(s) failed to park; stopping before the next episode",
                     file=sys.stderr,
                 )
                 status = 1
                 break
 
-            saved = getattr(sink, "num_episodes") > saved_before
+            saved = sink.num_episodes > saved_before
             aborted = episode_result is not None and episode_result.ended_by == "interrupted"
             if aborted:
                 if saved:
                     print("  episode interrupted; partial frames were saved")
                 else:
                     print("  episode interrupted before a frame was captured")
-            success = _rollout_yes_no(
-                input_fn, f"Episode {episode_index} successful? [y/n]: "
-            )
+            success = _rollout_yes_no(input_fn, f"Episode {episode_index} successful? [y/n]: ")
             if not saved:
                 print("  no LeRobot episode was written for this attempt")
             entries = manifest["episodes"]
@@ -1697,6 +1703,11 @@ def run_record(
     """
     from . import record as record_mod
 
+    if not dry_run:
+        if not repo_id:
+            raise ConfigurationError("record needs --repo-id")
+        root = record_mod.check_recording_destination(repo_id, root)
+
     stop = stop if stop is not None else threading.Event()
     cameras: dict[str, object] = {}
 
@@ -1726,9 +1737,7 @@ def run_record(
         # not what the dataset is about anyway.
         arms = {entry.name: entry.arm for entry in live_arms if entry.rig_arm.is_follower}
         if not arms:
-            raise ConfigurationError(
-                f"rig {rig.name!r} has no follower arms to record from"
-            )
+            raise ConfigurationError(f"rig {rig.name!r} has no follower arms to record from")
         for entry in live_arms:
             print(
                 f"  {entry.name:<8} {entry.rig_arm.model} on {entry.rig_arm.interface}"
@@ -1837,9 +1846,7 @@ def _build_teleop_source(
 
 
 def _add_common(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
-    parser.add_argument(
-        "--model", required=required, help=f"one of: {', '.join(SUPPORTED_MODELS)}"
-    )
+    parser.add_argument("--model", required=required, help=f"one of: {', '.join(SUPPORTED_MODELS)}")
     parser.add_argument(
         "--interface",
         required=required,
@@ -1851,10 +1858,56 @@ def _add_common(parser: argparse.ArgumentParser, *, required: bool = True) -> No
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+    from .terminal import RichArgumentParser, styled_output
+
+    parser = RichArgumentParser(
         prog="openpi-control", description="Preflight and maintenance for a connected arm."
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    health = sub.add_parser("health", help="read-only connection diagnostics")
+    health.add_argument("target", choices=("vr",))
+    health.add_argument("--vr-url", default="ws://127.0.0.1:8443/ws")
+    health.add_argument("--timeout", type=float, default=5, help="seconds to observe VR frames")
+
+    adb = sub.add_parser("adb", help="connect a Quest over USB")
+    adb.add_argument("action", choices=("connect",))
+    adb.add_argument("--serial", default=None, help="choose a device when several are connected")
+    adb.add_argument("--port", type=int, default=8443, help="local relay port to forward")
+    adb.add_argument("--open", action="store_true", help="also open the relay page in the headset")
+
+    quest = sub.add_parser(
+        "quest", help="native Quest app installation and USB controller streaming"
+    )
+    quest.add_argument("action", choices=("install", "start", "stop"))
+    quest.add_argument("--serial", default=None)
+    quest.add_argument("--vr-url", default="ws://127.0.0.1:8443/ws")
+    quest.add_argument(
+        "--apk",
+        type=Path,
+        default=Path(__file__).resolve().parents[2]
+        / "android/quest-streamer/build/openpi-quest-streamer.apk",
+    )
+
+    teleop = sub.add_parser(
+        "teleop", help="VR control of real arms; --backend sim for virtual arms"
+    )
+    teleop.add_argument("--backend", choices=("hardware", "sim"), default="hardware")
+    teleop.add_argument("--source", choices=("vr",), default="vr")
+    teleop.add_argument("--vr-url", default="ws://127.0.0.1:8443/ws")
+    teleop.add_argument("--vr-kit", type=Path, default=None)
+    teleop.add_argument("--yam-xml", default=None)
+    teleop.add_argument("--rate", type=float, default=100, help="IK rate in Hz")
+    teleop.add_argument("--port", type=int, default=8080, help="Viser port")
+    teleop.add_argument("--rig", default="yam_bimanual")
+    teleop.add_argument("--only", action="append")
+    teleop.add_argument("--interface", action="append", metavar="ARM=IFACE")
+    teleop.add_argument("--no-viz", action="store_true")
+    teleop.add_argument("--plain", action="store_true")
+    teleop.add_argument("--record", action="store_true", help="also record a dataset")
+    teleop.add_argument("--task", default="VR teleoperation")
+    teleop.add_argument("--repo-id", default=None, help="automatic unique name if omitted")
+    teleop.add_argument("--no-cameras", action="store_true", help="record state/actions only")
 
     doctor = sub.add_parser("doctor", help="read-only preflight checks for an arm or a rig")
     _add_common(doctor, required=False)
@@ -1897,9 +1950,7 @@ def main(argv: list[str] | None = None) -> int:
     live = sub.add_parser(
         "live", help="energize a rig, mirror it in the browser, then park it and power down"
     )
-    live.add_argument(
-        "--rig", default="yam_bimanual", help=f"one of: {', '.join(rig_names())}"
-    )
+    live.add_argument("--rig", default="yam_bimanual", help=f"one of: {', '.join(rig_names())}")
     live.add_argument(
         "--only",
         action="append",
@@ -1963,8 +2014,9 @@ def main(argv: list[str] | None = None) -> int:
         help="run bimanual YAM MolmoAct2 inference, execute chunks, and visualize them",
     )
     infer.add_argument(
-        "--rig", default="yam_bimanual", help="the trained bimanual YAM rig"
+        "--plain", action="store_true", help="use plain terminal output without the dashboard"
     )
+    infer.add_argument("--rig", default="yam_bimanual", help="the trained bimanual YAM rig")
     infer.add_argument(
         "--interface",
         action="append",
@@ -2097,9 +2149,7 @@ def main(argv: list[str] | None = None) -> int:
         "rollout",
         help="record interactive MolmoAct episodes as a LeRobot v3 dataset",
     )
-    rollout.add_argument(
-        "--rig", default="yam_bimanual", help="the trained bimanual YAM rig"
-    )
+    rollout.add_argument("--rig", default="yam_bimanual", help="the trained bimanual YAM rig")
     rollout.add_argument(
         "--interface",
         action="append",
@@ -2111,9 +2161,7 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="local/Hub dataset id, e.g. Dimios45/openpi-fold-towel-rollout-ablation",
     )
-    rollout.add_argument(
-        "--root", type=Path, default=None, help="local LeRobot dataset directory"
-    )
+    rollout.add_argument("--root", type=Path, default=None, help="local LeRobot dataset directory")
     rollout.add_argument(
         "--episodes", type=int, default=3, help="number of rollout attempts (default: 3)"
     )
@@ -2327,12 +2375,8 @@ def main(argv: list[str] | None = None) -> int:
         help="episode length for --teleop hold",
     )
     rec.add_argument("--vr-url", default=None, help="relay WebSocket URL")
-    rec.add_argument(
-        "--vr-kit", type=Path, default=None, help="path to a vr-teleop-kit checkout"
-    )
-    rec.add_argument(
-        "--yam-xml", default=None, help="YAM MJCF the VR inverse kinematics loads"
-    )
+    rec.add_argument("--vr-kit", type=Path, default=None, help="path to a vr-teleop-kit checkout")
+    rec.add_argument("--yam-xml", default=None, help="YAM MJCF the VR inverse kinematics loads")
     rec.add_argument(
         "--no-cameras",
         dest="cameras_enabled",
@@ -2353,15 +2397,17 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument(
         "--skip-preflight", action="store_true", help="record without the doctor checks"
     )
-    rec.add_argument(
-        "--push-to-hub", action="store_true", help="upload once the arms are down"
-    )
+    rec.add_argument("--push-to-hub", action="store_true", help="upload once the arms are down")
     rec.add_argument("--private", action="store_true", help="with --push-to-hub, keep it private")
 
     args = parser.parse_args(argv)
     log_path = runlog.setup_run_logging(args.command)
 
     commands = {
+        "quest": _command_quest,
+        "adb": _command_adb,
+        "health": _command_health,
+        "teleop": _command_teleop,
         "doctor": _command_doctor,
         "zero": _command_zero,
         "live": _command_live,
@@ -2370,11 +2416,65 @@ def main(argv: list[str] | None = None) -> int:
         "cameras": _command_cameras,
         "record": _command_record,
     }
-    try:
-        return commands[args.command](args, log_path)
-    except (ConfigurationError, InferenceError) as err:
-        print(f"error: {err}", file=sys.stderr)
-        return 2
+    with styled_output(
+        enabled=args.command not in ("infer", "teleop") and not getattr(args, "plain", False)
+    ):
+        try:
+            return commands[args.command](args, log_path)
+        except (ConfigurationError, InferenceError) as err:
+            from rich.console import Console
+            from rich.text import Text
+
+            Console(stderr=True, no_color=getattr(args, "plain", False)).print(
+                Text(f"error: {err}", style="red")
+            )
+            return 2
+
+
+def _command_quest(args: argparse.Namespace, log_path: Path) -> int:
+    from .quest_native import install_apk, stop_native, stream_native
+
+    if args.action == "install":
+        return install_apk(args.apk, args.serial)
+    if args.action == "stop":
+        return stop_native(args.serial)
+    return stream_native(args.serial, args.vr_url)
+
+
+def _command_adb(args: argparse.Namespace, log_path: Path) -> int:
+    from .quest_usb import connect_quest
+
+    return connect_quest(args.serial, args.port, args.open)
+
+
+def _command_health(args: argparse.Namespace, log_path: Path) -> int:
+    from .vr_health import check_vr
+
+    return check_vr(args.vr_url, args.timeout)
+
+
+def _command_teleop(args: argparse.Namespace, log_path: Path) -> int:
+    from .teleop_hardware import run_hardware
+    from .teleop_sim import run_sim
+    from .terminal import inference_terminal
+
+    if args.backend == "sim" and (args.record or args.only or args.rig != "yam_bimanual"):
+        raise ConfigurationError("sim currently supports the bimanual twin without recording")
+    args.instruction = args.task if args.record else "Hold grip to move · trigger controls gripper"
+    args.server = args.vr_url
+    args.speed = 1.0
+    args.park = args.backend == "hardware"
+    if args.record:
+        args.rate = 30  # The established recording loop runs at the dataset rate.
+    stop = threading.Event()
+    with inference_terminal(args, stop, log_path) as show_error:
+        try:
+            return run_sim(args, stop) if args.backend == "sim" else run_hardware(args, stop)
+        except (ConfigurationError, PiControlError) as err:
+            if show_error is None:
+                raise
+            show_error(err)
+            return 2
 
 
 def _command_doctor(args: argparse.Namespace, log_path: Path) -> int:
@@ -2389,9 +2489,7 @@ def _command_doctor(args: argparse.Namespace, log_path: Path) -> int:
         raise ConfigurationError("doctor needs either --rig, or both --model and --interface")
 
     print(f"doctor: {args.model} on {args.interface}")
-    results = run_doctor(
-        args.model, args.interface, effector_model=args.effector, probe=args.probe
-    )
+    results = run_doctor(args.model, args.interface, effector_model=args.effector, probe=args.probe)
     for result in results:
         print(result.render())
     failures = sum(1 for result in results if result.status == _FAIL)
@@ -2403,9 +2501,7 @@ def _command_doctor(args: argparse.Namespace, log_path: Path) -> int:
 
 def _doctor_rig(args: argparse.Namespace, log_path: Path) -> int:
     """Every arm of a rig, checked with the same code ``live`` preflights with."""
-    rig = resolve_rig(args.rig).with_interfaces(
-        _parse_interface_overrides(args.interface_override)
-    )
+    rig = resolve_rig(args.rig).with_interfaces(_parse_interface_overrides(args.interface_override))
     print(f"doctor: rig {rig.name} — {rig.description}")
     failures = warnings = 0
     for rig_arm in rig.arms:
@@ -2433,8 +2529,7 @@ def _doctor_rig(args: argparse.Namespace, log_path: Path) -> int:
         print(result.render())
 
     print(
-        f"\n{len(rig.arms)} arms, {len(rig.cameras)} cameras, "
-        f"{failures} failed, {warnings} warned"
+        f"\n{len(rig.arms)} arms, {len(rig.cameras)} cameras, {failures} failed, {warnings} warned"
     )
     print(f"log: {log_path}")
     return 1 if failures else 0
@@ -2447,9 +2542,7 @@ def _command_zero(args: argparse.Namespace, log_path: Path) -> int:
         plan = tuple(entry for entry in full_plan if entry.joint_id == args.joint)
         if not plan:
             known = ", ".join(str(entry.joint_id) for entry in full_plan)
-            raise ConfigurationError(
-                f"{args.model} has no joint {args.joint}; joints are {known}"
-            )
+            raise ConfigurationError(f"{args.model} has no joint {args.joint}; joints are {known}")
 
     port_type = plan_port_type(plan)
     if port_type is None:
@@ -2498,9 +2591,7 @@ def _parse_interface_overrides(values: list[str] | None) -> dict[str, str]:
     for value in values or []:
         arm, _, interface = value.partition("=")
         if not arm or not interface:
-            raise ConfigurationError(
-                f"--interface takes ARM=IFACE (e.g. left=can2), got {value!r}"
-            )
+            raise ConfigurationError(f"--interface takes ARM=IFACE (e.g. left=can2), got {value!r}")
         overrides[arm] = interface
     return overrides
 
@@ -2553,6 +2644,23 @@ def _command_live(args: argparse.Namespace, log_path: Path) -> int:
 
 
 def _command_infer(args: argparse.Namespace, log_path: Path) -> int:
+    from .terminal import inference_terminal
+
+    stop = threading.Event()
+    with inference_terminal(args, stop, log_path) as show_error:
+        try:
+            status = _run_command_infer(args, log_path, stop)
+        except (ConfigurationError, InferenceError, PiControlError) as err:
+            if show_error is None:
+                raise
+            show_error(err)
+            return 2
+        if status and show_error is not None:
+            show_error(RuntimeError("Inference stopped; see the error logs above."))
+        return status
+
+
+def _run_command_infer(args: argparse.Namespace, log_path: Path, stop: threading.Event) -> int:
     """Preflight and run the hardware-coupled MolmoAct2 loop."""
     rig = resolve_rig(args.rig).with_interfaces(_parse_interface_overrides(args.interface))
     if rig.names != ("left", "right"):
@@ -2576,8 +2684,11 @@ def _command_infer(args: argparse.Namespace, log_path: Path) -> int:
             )
             return 1
 
+    if stop.is_set():
+        return 0
     status = run_infer(
         rig,
+        stop=stop,
         instruction=args.instruction,
         server=args.server,
         request_timeout_s=args.request_timeout,
@@ -2705,9 +2816,7 @@ def _command_record(args: argparse.Namespace, log_path: Path) -> int:
     # a loop at 90 Hz reading 30 fps cameras would write each frame three times
     # and call it data. RGB straight from the SDK, because converting in numpy
     # costs 4.1 ms of an 11.1 ms tick with three cameras (see record.to_rgb).
-    rig = rig.with_camera_capture(
-        fps=args.camera_fps or args.fps, pixel_format="rgb8"
-    )
+    rig = rig.with_camera_capture(fps=args.camera_fps or args.fps, pixel_format="rgb8")
 
     # A dataset carries its task string on every frame, and relabelling means
     # rewriting the dataset, so an unset --task is worth a word rather than a
@@ -2764,6 +2873,7 @@ def _command_record(args: argparse.Namespace, log_path: Path) -> int:
         vr_url=args.vr_url,
         vr_kit=args.vr_kit,
         yam_xml=args.yam_xml,
+        stop=getattr(args, "_teleop_stop", None),
     )
     print(f"log: {log_path}")
     return status
