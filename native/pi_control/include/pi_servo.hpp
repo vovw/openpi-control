@@ -77,6 +77,9 @@ class Servo {
     float position_wrap_period_ = 0;                           ///< Optional single-turn feedback period; 0 disables startup unwrapping.
     float position_wrap_offset_rel_ = 0;                       ///< Runtime whole-turn offset added in the relative position frame.
     bool position_wrap_initialized_ = false;                   ///< Whether the startup wrap offset has been selected.
+    bool track_turns_ = false;                                 ///< Accumulate whole turns continuously instead of resolving one at startup.
+    bool turn_tracking_started_ = false;                       ///< Whether the accumulator has taken its first sample.
+    float last_raw_pos_abs_ = 0;                               ///< Previous single-turn feedback sample, for the accumulator delta.
     float spring_home_pos_rel_ = 0;                          ///< Spring equilibrium position in relative radian (where spring force is zero).
     float home_pos_rel_ = 0;                                 ///< Home position in relative radian (used for initial positioning and parking).
     float pos_min_rel_;                                       ///< Minimum position limit in relative radian.
@@ -272,6 +275,62 @@ class Servo {
      * @return ReturnCode indicating success or failure.
      */
     virtual ReturnCode apply_torque_with_damping(float torque) { return apply_torque(torque); }
+
+    /*!
+     * @brief Switches this servo to continuous multi-turn position tracking.
+     *
+     * ``initialize_position_wrap()`` resolves the whole turn exactly once, from
+     * wherever the joint is sitting at startup, and needs the travel to fit
+     * inside one feedback period to have a unique answer. A gripper whose
+     * stroke is *longer* than one turn has no such answer: its two ends alias
+     * onto nearly the same reading, so the startup guess is a coin flip that
+     * mislabels the whole session. Tracking turns as they happen removes the
+     * guess -- the frame's origin becomes wherever the servo was on the first
+     * sample, which is exactly why a calibration that measures both stops in
+     * this frame is what makes it meaningful.
+     *
+     * Must be enabled before the first feedback sample.
+     */
+    void enable_turn_tracking() {
+        track_turns_ = true;
+        turn_tracking_started_ = false;
+        position_wrap_initialized_ = true;  // the one-shot correction is superseded
+        position_wrap_offset_rel_ = 0;
+    }
+
+    bool turn_tracking_enabled() const { return track_turns_; }
+
+    /*!
+     * @brief Folds one single-turn feedback sample into the position frame.
+     *
+     * With tracking off this is the plain assignment the drivers always did.
+     * With it on, each sample contributes only its delta from the previous one,
+     * taken the short way around the feedback period, so travel past a wrap
+     * keeps counting up instead of jumping back a turn.
+     *
+     * @param raw_abs Position as the servo reported it, in absolute radian.
+     */
+    void accumulate_position(float raw_abs) {
+        if (!track_turns_ || position_wrap_period_ <= 0) {
+            curr_pos_abs_ = raw_abs;
+            return;
+        }
+        if (!turn_tracking_started_) {
+            turn_tracking_started_ = true;
+            last_raw_pos_abs_ = raw_abs;
+            curr_pos_abs_ = raw_abs;
+            return;
+        }
+        float delta = raw_abs - last_raw_pos_abs_;
+        const float half = position_wrap_period_ * 0.5f;
+        if (delta > half) {
+            delta -= position_wrap_period_;
+        } else if (delta < -half) {
+            delta += position_wrap_period_;
+        }
+        last_raw_pos_abs_ = raw_abs;
+        curr_pos_abs_ += delta;
+    }
 
     /*!
      * @brief Gets the servo's current position in relative radian.

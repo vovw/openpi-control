@@ -45,15 +45,15 @@ def check_interface(port_type: str, interface: str) -> str | None:
         if pathlib.Path(f"/sys/class/net/{interface}").exists():
             return None
         return (
-            f"CAN interface {interface!r} does not exist. "
-            "Plug in the adapter and check the names with run/devices.sh."
+            f"CAN interface {interface!r} does not exist. Plug in the adapter and list "
+            "the names with 'ip -brief link show type can'."
         )
     if port_type == PORT_TYPE_SERIAL:
         if pathlib.Path(interface).exists():
             return None
         return (
-            f"serial device {interface!r} does not exist. Plug in the adapter and "
-            "check the names with run/devices.sh (ls /dev/serial/by-id)."
+            f"serial device {interface!r} does not exist. Plug in the adapter and list "
+            "the names with 'ls /dev/serial/by-id'."
         )
     if port_type == PORT_TYPE_ETHERNET:
         try:

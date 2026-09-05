@@ -672,6 +672,19 @@ class Device {
     }
 
     /*!
+     * @brief Whether this device can enter the calibration gravity float.
+     *
+     * The predicate behind both the PI_CONTROL_CAP_GRAVITY_COMP handshake flag and
+     * set_runtime_gravity_float()'s own guard, so the capability the client is told
+     * about is exactly the one the runtime honors. A client that trusts a flag the
+     * runtime then rejects has no way to notice: the lifecycle command is one-way,
+     * so the refusal never reaches it and the arm just keeps holding.
+     *
+     * @return False by default; arms decide per role and per hardware.
+     */
+    virtual bool supports_gravity_float() const { return false; }
+
+    /*!
      * @brief Updates the per-joint torq_rescale at runtime (calibration tools).
      *
      * Lets gravity_tune try a new gravity-delivery candidate instantly, without a node

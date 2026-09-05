@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from collections import deque
 from pathlib import Path
 
@@ -39,6 +40,8 @@ from openpi_control.exceptions import (
     ProtocolError,
 )
 from openpi_control.native import (
+    PARKED_SHUTDOWN_EXIT_TIMEOUT_S,
+    SHUTDOWN_EXIT_TIMEOUT_S,
     NativeArmBackend,
     _native_process_failure,
     _Publisher,
@@ -2097,6 +2100,72 @@ def test_close_retires_later_resources_after_process_terminate_error():
     assert not backend._running
     assert socket.closed
     assert context.terminated
+
+
+class _ExitTimeoutProcess:
+    """Records the exit budget close() allows before it force-stops the node."""
+
+    def __init__(self) -> None:
+        self.wait_timeouts: list[float] = []
+        self.killed = False
+
+    def poll(self):
+        return None
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        return 0
+
+
+def _close_with_stub_process(
+    *, move_to_ready: bool, accept: bool = True
+) -> _ExitTimeoutProcess:
+    backend = make_consuming_backend()
+    backend._context.term()
+    process = _ExitTimeoutProcess()
+    backend._process = process
+    backend._context = types.SimpleNamespace(term=lambda: None)
+    backend._running = True
+
+    def send_lifecycle(*args, **kwargs):
+        del args, kwargs
+        if not accept:
+            raise RuntimeError("native shutdown failed")
+
+    backend._send_lifecycle = send_lifecycle
+    backend.close(move_to_ready=move_to_ready)
+    return process
+
+
+def test_parked_shutdown_waits_out_the_whole_move_before_killing_the_node():
+    # The node acks MOVE_TO_READY_AND_SHUTDOWN on *receipt* and only then drives
+    # to home_pos, so this wait is the entire budget the park gets. At the
+    # plain-shutdown 5s the node was killed partway through the move and the arm
+    # stopped wherever it had got to instead of at home_pos.
+    process = _close_with_stub_process(move_to_ready=True)
+
+    assert process.wait_timeouts[0] == PARKED_SHUTDOWN_EXIT_TIMEOUT_S
+    assert PARKED_SHUTDOWN_EXIT_TIMEOUT_S > SHUTDOWN_EXIT_TIMEOUT_S
+    assert not process.killed
+
+
+def test_unparked_shutdown_keeps_the_short_exit_budget():
+    # Nothing is moving: the node de-energizes where the arm stands and exits.
+    process = _close_with_stub_process(move_to_ready=False)
+
+    assert process.wait_timeouts[0] == SHUTDOWN_EXIT_TIMEOUT_S
+
+
+def test_a_rejected_park_does_not_hold_the_caller_for_a_move_that_never_started():
+    process = _close_with_stub_process(move_to_ready=True, accept=False)
+
+    assert process.wait_timeouts[0] == SHUTDOWN_EXIT_TIMEOUT_S
 
 
 def test_close_retires_later_resources_after_process_wait_error():

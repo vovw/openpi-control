@@ -159,6 +159,47 @@ TEST(FollowerGravityCompensation, CapabilityGatesMatchArmAndAlgoTypes) {
     EXPECT_TRUE(pino_algo.has_gravity_model());
 }
 
+// Exposes the two members Device::init() would otherwise be needed to populate,
+// so the advertised-capability predicate can be probed without a full config.
+template <typename ArmT>
+class GravityFloatProbe : public ArmT {
+   public:
+    using ArmT::ArmT;
+
+    void set_role_for_test(Role role) { this->role_ = role; }
+    void set_algo_for_test(std::unique_ptr<Algo> algo) { this->p_algo_ = std::move(algo); }
+};
+
+TEST(FollowerGravityCompensation, GravityFloatIsAdvertisedOnlyWhereItWorks) {
+    // supports_gravity_float() is what the handshake advertises as
+    // PI_CONTROL_CAP_GRAVITY_COMP and what set_runtime_gravity_float() enforces. A
+    // client cannot detect a disagreement between the two -- the lifecycle command is
+    // one-way -- so an unadvertised-but-working float reads to the operator as an arm
+    // that stayed rigid, with nothing in the log.
+    CommandLineArgs cla{};
+
+    GravityFloatProbe<DeviceArmCan> can_arm(cla);
+    EXPECT_FALSE(can_arm.supports_gravity_float());  // no role, no gravity model
+
+    can_arm.set_role_for_test(Role::FOLLOWER);
+    EXPECT_FALSE(can_arm.supports_gravity_float());  // still no dynamics model
+
+    can_arm.set_algo_for_test(std::make_unique<AlgoPino>(&can_arm, cla));
+    EXPECT_TRUE(can_arm.supports_gravity_float());  // the case --float depends on
+
+    // A leader reaches its float through force feedback instead, so it must not claim
+    // this one: the same flag used to mean only the leader's kind.
+    can_arm.set_role_for_test(Role::LEADER);
+    EXPECT_FALSE(can_arm.supports_gravity_float());
+
+    // A position-only serial bus can hold a follower but cannot be handed the gravity
+    // torque, gravity model or not.
+    GravityFloatProbe<DeviceArmSerial> serial_arm(cla);
+    serial_arm.set_role_for_test(Role::FOLLOWER);
+    serial_arm.set_algo_for_test(std::make_unique<AlgoPino>(&serial_arm, cla));
+    EXPECT_FALSE(serial_arm.supports_gravity_float());
+}
+
 class SocketBackedDriverCanMit : public DriverCanMit {
    public:
     using DriverCanMit::DriverCanMit;

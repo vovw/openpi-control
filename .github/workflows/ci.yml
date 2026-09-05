@@ -43,7 +43,7 @@ jobs:
       - name: Install package with native runtime disabled
         run: |
           uv venv
-          uv pip install -e '.[dev]' \
+          uv pip install -e '.[dev,inference,vr]' \
             -C cmake.define.OPENPI_CONTROL_BUILD_NATIVE=OFF
 
       - name: Ruff

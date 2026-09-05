@@ -35,6 +35,7 @@ add_executable(pi_control_tests
   test_driver_can.cpp
   test_posix_syscall_hooks.cpp
   test_servo_dm_status.cpp
+  test_servo_turn_tracking.cpp
   test_driver_base.cpp
   test_fr3_controller.cpp
   test_robotiq.cpp

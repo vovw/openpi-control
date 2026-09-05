@@ -1109,7 +1109,7 @@ ReturnCode DriverCanMit::read_hardware_values(Servo* p_servo) {
         // the reception thread may be parsing a newer frame concurrently.
         std::lock_guard<std::mutex> lock(received_servo_data_mutex_);
         const ReceivedServoData& data = received_servo_data_[p_servo_dm->data_index_];
-        p_servo_dm->curr_pos_abs_ = data.angle_actual_rad_;
+        p_servo_dm->accumulate_position(data.angle_actual_rad_);
         p_servo_dm->curr_vel_ = data.speed_actual_rad_;
         p_servo_dm->curr_tor_ = data.current_actual_float_;
         p_servo_dm->temperature_ = data.temperature_;
