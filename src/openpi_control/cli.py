@@ -1876,19 +1876,6 @@ def main(argv: list[str] | None = None) -> int:
     adb.add_argument("--port", type=int, default=8443, help="local relay port to forward")
     adb.add_argument("--open", action="store_true", help="also open the relay page in the headset")
 
-    quest = sub.add_parser(
-        "quest", help="native Quest app installation and USB controller streaming"
-    )
-    quest.add_argument("action", choices=("install", "start", "stop"))
-    quest.add_argument("--serial", default=None)
-    quest.add_argument("--vr-url", default="ws://127.0.0.1:8443/ws")
-    quest.add_argument(
-        "--apk",
-        type=Path,
-        default=Path(__file__).resolve().parents[2]
-        / "android/quest-streamer/build/openpi-quest-streamer.apk",
-    )
-
     teleop = sub.add_parser(
         "teleop", help="VR control of real arms; --backend sim for virtual arms"
     )
@@ -2404,7 +2391,6 @@ def main(argv: list[str] | None = None) -> int:
     log_path = runlog.setup_run_logging(args.command)
 
     commands = {
-        "quest": _command_quest,
         "adb": _command_adb,
         "health": _command_health,
         "teleop": _command_teleop,
@@ -2429,16 +2415,6 @@ def main(argv: list[str] | None = None) -> int:
                 Text(f"error: {err}", style="red")
             )
             return 2
-
-
-def _command_quest(args: argparse.Namespace, log_path: Path) -> int:
-    from .quest_native import install_apk, stop_native, stream_native
-
-    if args.action == "install":
-        return install_apk(args.apk, args.serial)
-    if args.action == "stop":
-        return stop_native(args.serial)
-    return stream_native(args.serial, args.vr_url)
 
 
 def _command_adb(args: argparse.Namespace, log_path: Path) -> int:

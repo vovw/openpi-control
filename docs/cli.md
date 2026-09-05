@@ -71,7 +71,7 @@ uv run --no-sync openpi-control live --no-cameras
 | Command | What it does |
 | --- | --- |
 | [`cameras`](cameras.md) | Find cameras, probe streams, save snapshots. |
-| [`adb connect`, `quest`, `health vr`](vr.md) | Connect and diagnose Quest input. |
+| [`adb connect`, `health vr`](vr.md) | Connect and diagnose Quest input. |
 | [`teleop`](vr.md) | Drive real arms; `--backend sim` selects virtual arms. |
 | [`record`](recording.md) | Record teleoperation as a LeRobot dataset. |
 | [`infer`](inference.md) | Execute policy actions. |

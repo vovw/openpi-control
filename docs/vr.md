@@ -79,31 +79,3 @@ uv run --no-sync openpi-control teleop --record --task "fold the towel"
 
 Recording uses a 30 FPS loop and has no Viser mirror. See
 [recording](recording.md) for save/discard behavior.
-
-## Native Quest app
-
-Use the native OpenXR app instead of the browser for controller input.
-Set these paths to installed SDKs and an extracted Khronos OpenXR loader AAR:
-
-```bash
-export ANDROID_NDK_HOME=/path/to/android-ndk
-export ANDROID_SDK_ROOT=/path/to/android-sdk
-export JAVA_HOME=/path/to/jdk
-export OPENXR_AAR_DIR=/path/to/extracted-openxr-aar
-
-# Build and sign the APK; requires Android build-tools 35.0.0 and platform 32.
-bash android/quest-streamer/build.sh
-
-# Install the built APK on the USB-connected Quest.
-uv run --no-sync openpi-control quest install
-
-# Launch the app and bridge its controller frames to the running relay.
-uv run --no-sync openpi-control quest start
-
-# Stop the headset app.
-uv run --no-sync openpi-control quest stop
-```
-
-Keep `quest start` running while using `teleop` in another terminal.
-`quest install --apk PATH` selects another APK. Tracking requires a focused,
-awake headset with visible controllers; re-clutch after restarting the app.

@@ -88,7 +88,7 @@ uv run --no-sync openpi-control rollout \
 ## Commands and development
 
 - [CLI](docs/cli.md): preflight, calibration, and live control.
-- [VR](docs/vr.md): relay, Quest USB/native app, simulation, and hardware.
+- [VR](docs/vr.md): relay, Quest USB, simulation, and hardware.
 - [Cameras](docs/cameras.md): discovery, snapshots, and overrides.
 - [Recording](docs/recording.md): teleop datasets and episode controls.
 - [Inference](docs/inference.md): policy execution and rollout options.

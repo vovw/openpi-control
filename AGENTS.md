@@ -29,7 +29,6 @@ prepared environment. The VR relay has its own environment in the submodule.
 - `viz.py`: rendering; `cameras.py`: capture; `record.py`: LeRobot episodes.
 - `inference.py`, `inference_record.py`: policy transport, execution, and recording.
 - `teleop_vr.py`, `teleop_hardware.py`, `teleop_sim.py`: Quest adapter and runners.
-- `android/quest-streamer`: native OpenXR controller input app.
 - `native/pi_control`: C++ control runtime, drivers, and tests.
 
 ## Invariants
